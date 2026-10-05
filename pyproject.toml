@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MRAi-P3"
+version = "1.1.2"
+description = "Magnetic Resonance processing with Artificial intelligence for Peak Probability Presentation"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+authors = [
+    { name = "Amir Jahangiri", email = "amir.jahangiri@gu.se" },
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Classifier: License :: OSI Approved :: MIT License",
+    "Classifier: Operating System :: OS Independent",
+]
+dependencies = [
+    "numpy >=1.24,<3",
+    "nmrglue >=0.12,<1",
+    "tensorflow >=2.13,<3",
+    "matplotlib >=3.9,<4",
+    "scipy >=1.9",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
