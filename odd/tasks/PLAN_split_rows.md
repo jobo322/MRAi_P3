@@ -1,12 +1,9 @@
 # Plan: `split_2d_rows` — calcular solo las filas que se guardan
 
-**Estado:** PLAN — no implementado. Pendiente de revisión (**revisión 2**, ver §12).
+**Estado:** **IMPLEMENTADO** y verificado (§9, §14).
 **Repo:** `mrai_p3`, rama `install_in_mac_m1`.
-**Baseline real:** el **árbol de trabajo sin commitear** sobre `efd2bcc` (19 ficheros
-modificados). El refactor *pool* (`build_pool`/`pool_k`/`subsample_pool`) **no existe
-en `efd2bcc`** — `git show efd2bcc:scripts/preextract.py | grep -c pool_k` → `0`.
-**Acción previa obligatoria:** commitear ese refactor para tener un baseline limpio
-antes de tocar el split (paso 0 de §10).
+**Baseline:** commit `a163563` (el refactor *pool* ya está commiteado; la base quedó
+limpia con `74e3cd1` + `34ec4b5` + `a163563`).
 **Fecha mediciones:** 2026-10-15 · **Máquina:** MacBook Air M1, 8 cores, 16 GB, macOS 26.6.2
 **Dataset:** `/Users/abolanos/git/cheminfo/spectrum-generator/dataset` — 1000 espectros `256×2048` (`spectra/*.bin` 2.0 MB + `labels/*.bin` 0.5 MB)
 **Pool existente:** `data/pre_elong/` — 1000 `.npz`, 3.0 GB, generado con `--seed 0 --pool-k 10 --fast`
@@ -243,12 +240,80 @@ válidos; no hay que re-extraer.**
 - No se migra a MLX ni a TF-Metal (planes anteriores, descartados aquí).
 
 > **Dato para el revisor:** tras este cambio la ruta *on-demand* queda en
-> ~2,2 s de datos por época (≈15 s/época con cómputo), **igual que la
-> pre-extraída**, y su RAM pico baja de 1,39 GB a **0,17 GB** (§3). Es decir:
+> ~3,4 s de datos por época (≈18 s/época con cómputo) frente a ~0,8 s de la
+> pre-extraída, y su RAM pico baja de 1,39 GB a **0,17 GB** (§3). Es decir:
 > tras el cambio **ni la velocidad ni la RAM** justifican pre-extraer (el
 > argumento de 1,39 GB correspondía al split completo antiguo). Se mantiene
-> solo por consistencia con el flujo Colab ya montado y por no pagar split por
-> época. **Punto legítimo a discutir.**
+> por consistencia con el flujo Colab y por ~2,7 s/época. **Punto legítimo a
+> discutir** — ver §6.1.
+
+### 6.1 ¿Sigue siendo necesaria la preextracción? (medido, 2026-10-15)
+
+> Corrección de encuadre: el cambio acelera **la preextracción** y **el
+> entrenamiento *on-demand***. **No** acelera el entrenamiento *pre-extraído*:
+> en esa ruta `split_2d` nunca se ejecuta durante el entrenamiento.
+
+Coste de datos por espectro (medido, 60 espectros, caché caliente):
+
+| Ruta | ms/espectro | 800 esp/época |
+|---|---:|---:|
+| Pre-extraída (`npz` 3,32 MB + `subsample_pool`) | **0,97** | **0,78 s** |
+| On-demand con `split_2d_rows` (nuevo) | **4,30** | **3,44 s** |
+| On-demand con `split_2d_fast` completo (viejo) | ~175 | ~140 s |
+
+Preextracción de 1000 espectros: **219 s** (log real `preextract.log`,
+mediana 0,200 s/esp) → **11–16 s** medidos (16,4 / 11,5 / 11,1 ms/esp en 3
+pasadas). ~**15–20×**, no 5–6 s: el coste lo domina escribir 3,32 MB/esp.
+
+Época real del run completado: **~15 s** (`COLAB.md`: "100 épocas en 24:32"
+= 24 min 32 s → 14,7 s/época; consistente con los mtimes del run: ~56 min
+para ~171 épocas).
+
+Reparto del tiempo de época:
+
+| Ruta | datos/época | % de la época |
+|---|---:|---:|
+| Pre-extraída | 0,78 s | **~5 %** |
+| On-demand (nuevo) | 3,44 s | **~20 %** |
+| On-demand (viejo) | ~140 s | ~90 % |
+
+**El cuello de botella cambió de sitio.** Antes el `split_2d` dominaba
+(140 s de ~155 s): trabajo 82× redundante y pipeline *data-bound*. Ahora
+manda el **cómputo del modelo**.
+
+**Sobre el solapamiento (`prefetch`).** `BinSequence.to_dataset()` usa
+`.prefetch(2)`, así que en teoría el prep podría esconderse tras el cómputo.
+Evidencia indirecta de que **no** lo hace en Mac: el run on-demand viejo
+tardaba ~210 s/época ≈ 140 s de prep + ~15 s de cómputo → es **aditivo**.
+El log muestra `TF 2.21.0 GPUs: []` (Mac CPU-only): el hilo generador compite
+por los mismos 8 cores y el mismo bus de memoria.
+
+> ⚠️ **Medición pendiente (la única que zanja la pregunta):** si el `prefetch`
+> sí solapara bien, on-demand = pre-extraída y el ahorro sería 0. Requiere TF
+> instalado: `--n-train 200 --epochs 3` con y sin `--preextracted`, comparando
+> tiempo de pared. No se pudo hacer en el entorno de este plan.
+
+**Veredicto: no es obligatoria, pero sigue siendo rentable.**
+
+- **Break-even:** ~11 s de preextracción ÷ ~2,7 s ahorrados por época ≈
+  **4 épocas**.
+- **Run completo (171 épocas):** ahorra ~2,7 s × 171 ≈ **7,6 min** (13–18 %
+  de un run de 42–57 min), costando ~15 s y 3,0 GB de disco.
+- **Run corto (≤4 épocas):** on-demand gana (no escribe 3 GB).
+
+| Escenario | Recomendación | Por qué |
+|---|---|---|
+| Mac CPU, run completo (171 ép.) | **Pre-extraer** | ahorra ~7,6 min; coste 15 s |
+| Mac CPU, experimento (≤5 ép.) | On-demand | no se alcanza el break-even |
+| Colab GPU | **Pre-extraer** | compute más barato → el prep pesa relativamente más |
+| Colab, reanudar sesión | **Pre-extraer** | `/content` es efímero: se re-extrae cada sesión (antes ~6 min, ahora ~20 s) |
+
+**Único argumento restante a favor de on-demand (científico, no de
+velocidad):** el pool con `pool_k=10` tapa el fondo a `10 × n_pos ≈ 5 760`
+píxeles de los ~523 700 disponibles (**1,1 %**); on-demand muestrea de los
+523 700. El *soporte* del pool está acotado para siempre. Si importa la
+diversidad máxima de fondo, on-demand es estrictamente mejor **y ahora es
+barato**.
 
 ---
 
@@ -284,28 +349,39 @@ Tests existentes que deben seguir verdes: `test_cross_fast.py` (2),
   → `colab/scripts/`, `diff` = 0 en los 5 (verificado hoy: sin diferencias).
 - `py_compile` en `scripts/`, `colab/scripts/`, `colab/tools/`, `tests/`.
 - `colab/COLAB.md`:
-  - §4: sustituir "219 s (3,6 min), ~3,0 GB" por ~5–6 s.
+  - §4: sustituir "219 s (3,6 min), ~3,0 GB" por **~11–16 s** medidos.
   - §4: añadir nota **"GPU y `--workers` medidos y descartados"** con las
     tablas de §2 para que no se reabra el debate.
-  - §4: la ruta on-demand ya no es lenta → actualizar comparativa.
+  - §4: la ruta on-demand ya no es lenta (~3,5 min/época → ~18 s) →
+    actualizar la comparativa y el encuadre de §6.1.
 - `colab/MRAi_Colab_Train.ipynb`: celda 13 (markdown) dice hoy
-  "en el Mac son ~3,5 min/época con el split vectorizado" → ~15 s/época.
-  Celda 4b (pre-extracción) → actualizar tiempo/ETA.
+  "en el Mac son ~3,5 min/época con el split vectorizado" → ~18 s/época.
+  Celda 4b (pre-extracción) → actualizar tiempo/ETA (~11–16 s).
 - JSON del notebook re-parseado tras editar.
 
 ---
 
-## 9. Validación final (gate de aceptación)
+## 9. Validación final (gate de aceptación) — RESULTADOS
 
-- [ ] `python3 -m pytest tests/ -q` → 20 actuales (2 `test_cross_fast` +
-      3 `test_pool_equiv` + 15 `test_headers`) + 5 nuevos de
-      `test_split_rows.py` = **25** (recontar al cerrar; no fijar a mano)
-- [ ] Byte-identity 1000 espectros vs `data/pre_elong/` → `True`
-- [ ] `diff scripts/ ↔ colab/scripts/` → idénticos (5/5)
-- [ ] `py_compile` sin errores
-- [ ] Tiempos re-medidos: preextract ≈ 5–6 s/1000; on-demand ≈ 2,2 s/época
-- [ ] Notebook JSON válido, 19 celdas
-- [ ] `git status` limpio respecto a `Trained/` y `data/`
+- [x] `python3 -m pytest tests/ -q` → **28 passed, 3 skipped** (los 3 skips son
+      `test_headers.py` por falta de `showhdr`/NMRPipe en el PATH). 12 tests
+      nuevos en `tests/test_split_rows.py`, 23 subtests.
+- [x] Byte-identity **1000/1000 espectros** vs `data/pre_elong/` (X, y y
+      `n_pos`) en 9,9 s → 9,9 ms/espectro. Además, CLI real sobre 20
+      espectros: default ≡ `--fast` ≡ `--slow-split` ≡ pool guardado.
+- [x] `diff scripts/ ↔ colab/scripts/` → idénticos (5/5)
+- [x] `py_compile` sin errores en `scripts/`, `colab/scripts/`, `colab/tools/`,
+      `tests/`
+- [x] Tiempos re-medidos (CLI real, 20 espectros): **default 12,2 ms/espectro**
+      (~12 s/1000) vs **`--slow-split` 950,9 ms/espectro** (~16 min/1000) →
+      **78×**. On-demand: 3,4 s de datos/época (~20 % de una época de ~15 s).
+- [ ] **Medición pendiente (requiere TF):** 3 épocas con y sin
+      `--preextracted` sobre 200 espectros → decide si la preextracción se
+      mantiene (§6.1). Sin ella, el ahorro de 2,7 s/época es una estimación,
+      no un hecho medido. **No bloquea la entrega.**
+- [x] Notebook JSON válido, 19 celdas
+- [x] `git status` limpio respecto a `Trained/` y `data/` (`data/`,
+      `Trained copy/` y los PDFs están en `.gitignore`)
 
 ---
 
@@ -365,3 +441,83 @@ Aplicados tras la revisión del plan:
 **Riesgo residual principal (sin cambios):** diferencias numéricas en
 `col[ii,jj]` vs `col.reshape(H*W,c0)[idx]`. Mitigado por el test 1 + la
 byte-identity de 1000 espectros; la paridad de `Norm` la cubre el test 1.
+
+---
+
+## 13. Cambios de esta revisión (r3 — análisis de necesidad)
+
+Añadido tras medir el coste real de ambas rutas con los datos del repo:
+
+1. **§6.1 nuevo:** tabla de coste medido por ruta (0,97 / 4,30 / ~175 ms por
+   espectro), reparto del tiempo de época, y la corrección de encuadre — el
+   cambio **no** acelera el entrenamiento pre-extraído.
+2. **Número real de preextracción:** 219 s → **11–16 s** medidos (el plan
+   decía 5–6 s).
+3. **Tabla de decisión por entorno** (Mac CPU / experimento corto / Colab GPU
+   / Colab reanudar).
+4. **Break-even explícito:** ~4 épocas.
+5. **Medición pendiente documentada** en §9 y §6.1: el efecto del `prefetch`
+   sobre el solapamiento no se pudo medir sin TF; la evidencia indirecta
+   (run viejo aditivo) sugiere que no solapa.
+6. **Único argumento restante para on-demand:** soporte de fondo 1,1 % vs
+   100 % (científico, no de velocidad).
+
+**Correcciones de datos colaterales:** `COLAB.md` y la celda 13 del notebook
+arrastran el número viejo "on-demand ~3,5 min/época" (pre-`split_2d_rows`);
+con el cambio son **~18 s/época**. Y
+`Trained/Probability_2D_Elongated/DNN_0/stdout_part1.log` es un run viejo
+(on-demand sobre `dataset/`, 800 steps/época, ~830 s/época) — **no** es
+representativo del config actual.
+
+---
+
+## 14. Registro de implementación
+
+### 14.1 Base limpia (3 commits, antes de tocar el split)
+
+| Commit | Contenido |
+|---|---|
+| `74e3cd1` | `chore: ignore generated artifacts and stop tracking them` — `.gitignore` para `.DS_Store`, `__pycache__`, `.pytest_cache`, `data/`, `Trained copy/`, PDFs; destrackeados los 17 artefactos que ya estaban versionados |
+| `34ec4b5` | `fix(headers): map showhdr columns to NMRPipe dims via ORDER` — fix independiente que estaba sin commitear |
+| `a163563` | `feat(pool): pre-extract a per-spectrum background pool` — el refactor *pool* que este plan asume como punto de partida |
+
+### 14.2 Cambios implementados
+
+| Fichero | Cambio |
+|---|---|
+| `scripts/cross_extract_fast.py` (+`colab/scripts/`) | nueva `split_2d_rows(S, idx, Cross_Size)`; docstring del módulo actualizado |
+| `scripts/preextract.py` (+`colab/scripts/`) | nueva `plan_pool_idx(L, pool_k, max_pts, rng)`; `build_pool` pasa a wrapper; `main()` planifica `idx` antes del split; `--slow-split` (referencia) y `--fast` (no-op) en `mutually_exclusive_group` |
+| `scripts/train_model.py` (+`colab/scripts/`) | `_points()` calcula `idx` antes del split y usa `split_2d_rows`; `self.fast_split`; la rama lenta conserva `split_2d` + `X[idx]` |
+| `tests/test_split_rows.py` | **nuevo**, 12 tests / 23 subtests |
+| `colab/COLAB.md`, `colab/MRAi_Colab_Train.ipynb` | tiempos actualizados, tabla de decisión y nota "GPU/`--workers` descartados" |
+
+### 14.3 Evidencia de verificación
+
+```
+pytest tests/ -q          -> 28 passed, 3 skipped (los 3 por falta de showhdr)
+py_compile (4 dirs)       -> OK
+diff scripts/ colab/      -> 5/5 idénticos
+notebook                  -> JSON válido, 19 celdas
+byte-identity 1000 esp    -> 1000/1000 (X, y, n_pos) en 9,9 s
+CLI 20 esp: default       -> 12,2 ms/espectro
+CLI 20 esp: --slow-split  -> 950,9 ms/espectro  (78x)
+```
+
+El test de regresión de `tests/test_split_rows.py` reproduce el pool guardado
+desde `data/pre_elong/` (mismo `seed`, mismo orden de ids → misma secuencia
+`rng.choice`) y lo compara byte a byte; el chequeo de 1000 espectros de arriba
+es ese mismo test extendido a todo el dataset.
+
+### 14.4 Desviaciones respecto al plan
+
+1. **`--slow-split` vs `--fast`:** el plan decía "`--slow-split` gana". Se
+   implementó `mutually_exclusive_group`, así que pasar ambos es un error de
+   argparse (más claro que una precedencia silenciosa).
+2. **`--fast` se conserva** como no-op documentado (la celda 12 del notebook
+   lo sigue pasando), con `help` que lo dice explícitamente.
+3. **`split_2d_rows` devuelve `(len(idx), c0+c1, 1)`** en lugar de
+   `(len(idx), 128, 1)` fijo: es la forma general y coincide con la
+   referencia para `CROSS = [64, 64]`.
+4. **Guardas de import** en `preextract.py` y `train_model.py`
+   (`HAVE_FAST_SPLIT`), siguiendo el patrón que ya usaba `train_model.py`:
+   sin `cross_extract_fast` el CLI cae al split completo con un aviso.

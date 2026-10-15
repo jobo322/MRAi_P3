@@ -1,8 +1,14 @@
 """Pre-extract a per-spectrum background POOL for training.
 
-Runs the expensive split_2d ONCE per spectrum (loop or --fast vectorised
-version, bit-identical) and stores a pool: ALL positives (rows 0:n_pos)
-plus pool_k * n_pos background pixels chosen with a FIXED --seed.
+Runs the expensive split_2d ONCE per spectrum and stores a pool: ALL
+positives (rows 0:n_pos) plus pool_k * n_pos background pixels chosen with
+a FIXED --seed. Only the pool rows are ever computed (split_2d_rows), so
+the 524288-row matrix of the reference implementation is never allocated
+(1000 spectra: 219 s -> ~11-16 s, 1.39 GB -> 0.17 GB peak RAM).
+
+--slow-split keeps the reference path (full split_2d + X[idx]) for
+verification; --fast is accepted and ignored so the Colab notebook keeps
+working. The two are mutually exclusive.
 
 Training then subsamples that pool every epoch (train_model.subsample_pool
 takes all positives + bg_ratio*n_pos background rows with a fresh rng), so
@@ -39,14 +45,13 @@ available only if you must shrink the upload.
 Usage:
   python3 scripts/preextract.py --dataset .../dataset \\
       --ids data/train_2d_elong/manifest.json --out data/pre_elong \\
-      --seed 0 --pool-k 10 --fast
+      --seed 0 --pool-k 10
   # then train (--bg-ratio controls the per-epoch subsampling):
   python3 scripts/train_model.py --data data/pre_elong --preextracted \\
       --bg-ratio 2 --lr 1e-4 ...
 
-Memory: one spectrum -> X complete (524288,128,1) float64 = 512 MB
-transient, then only the pool kept (~3.3 MB fp32 with pool_k=10). Runs
-spectrum-by-spectrum, peak RAM < 1.5 GB.
+Memory: one spectrum -> only the pool rows are built (~6400 x 128 fp64
+= 6.5 MB), then stored as ~3.3 MB fp32. Peak RAM < 0.2 GB.
 """
 import argparse
 import csv
@@ -61,6 +66,12 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 from cross_extract import split_2d as split_2d_loop  # noqa: E402
 
+try:
+    from cross_extract_fast import split_2d_rows  # noqa: E402
+    HAVE_FAST_SPLIT = True
+except ImportError:  # pragma: no cover - scripts/ always ships the module
+    HAVE_FAST_SPLIT = False
+
 SHAPE = (256, 2048)
 CROSS = np.array([64, 64])
 
@@ -73,6 +84,29 @@ def load_pair(ds_dir, sid):
     return np.ascontiguousarray(S), np.ascontiguousarray(L)
 
 
+def plan_pool_idx(L, pool_k, max_pts=None, rng=None):
+    """Rows that form the pool: all positives, then pool_k*pos background.
+
+    Pure index planning, independent of X: this is what lets the caller
+    compute only the selected cross sections instead of the whole
+    (H*W, 128, 1) matrix. Returns (idx, n_pos); rows [0:n_pos] of `idx`
+    are the positives and [n_pos:] the background pool.
+
+    `rng.choice` is called exactly once, in the same order as the previous
+    build_pool implementation, so the selected pool is unchanged for a
+    given seed (tests/test_split_rows.py pins this).
+    """
+    y = L.reshape(-1, 1)
+    pos = np.where(y[:, 0] > 0.5)[0]
+    n_pos = len(pos)
+    neg = np.where(y[:, 0] < 0.5)[0]
+    n_bg = min(len(neg), int(n_pos * pool_k))
+    if max_pts is not None:
+        n_bg = min(n_bg, max(0, max_pts - n_pos))
+    bg = rng.choice(neg, size=max(0, n_bg), replace=False)
+    return np.concatenate([pos, bg]), n_pos
+
+
 def build_pool(X, L, pool_k, max_pts=None, rng=None):
     """Pool por espectro: TODOS los positivos (filas 0:n_pos) + pool_k*pos
     píxeles de fondo elegidos una sola vez.
@@ -83,17 +117,12 @@ def build_pool(X, L, pool_k, max_pts=None, rng=None):
 
     Devuelve (X_pool, y_pool, n_pos). Las filas [0:n_pos] son positivos,
     [n_pos:] es el pool de fondo.
+
+    Wrapper fino sobre plan_pool_idx: se mantiene porque es la fuente única
+    de verdad de la semántica del pool (tests/test_pool_equiv.py).
     """
-    y = L.reshape(-1, 1)
-    pos = np.where(y[:, 0] > 0.5)[0]
-    n_pos = len(pos)
-    neg = np.where(y[:, 0] < 0.5)[0]
-    n_bg = min(len(neg), int(n_pos * pool_k))
-    if max_pts is not None:
-        n_bg = min(n_bg, max(0, max_pts - n_pos))
-    bg = rng.choice(neg, size=max(0, n_bg), replace=False)
-    idx = np.concatenate([pos, bg])
-    return X[idx], y[idx], n_pos
+    idx, n_pos = plan_pool_idx(L, pool_k, max_pts, rng)
+    return X[idx], L.reshape(-1, 1)[idx], n_pos
 
 
 def main():
@@ -110,16 +139,23 @@ def main():
                          "debe ser > --bg-ratio de train para que el fondo varíe)")
     ap.add_argument("--max-pts", type=int, default=None,
                     help="tope opcional de puntos por espectro (acota el tamaño)")
-    ap.add_argument("--fast", action="store_true",
-                    help="use cross_extract_fast (bit-identical, ~6x)")
+    split = ap.add_mutually_exclusive_group()
+    split.add_argument("--slow-split", action="store_true",
+                       help="referencia: split_2d completo (matriz de 524288 "
+                            "filas) + X[idx]; lento, solo para verificar")
+    split.add_argument("--fast", action="store_true",
+                       help="[no-op] antes elegía cross_extract_fast; el split "
+                            "por filas ya es el camino por defecto")
     ap.add_argument("--compress", action="store_true",
                     help="np.savez_compressed (smaller, 26x slower write)")
     args = ap.parse_args()
 
-    split_2d = split_2d_loop
-    if args.fast:
-        from cross_extract_fast import split_2d_fast
-        split_2d = split_2d_fast
+    slow_split = args.slow_split or not HAVE_FAST_SPLIT
+    if args.slow_split and not HAVE_FAST_SPLIT:
+        print("aviso: cross_extract_fast no disponible", flush=True)
+    elif not HAVE_FAST_SPLIT:
+        print("aviso: cross_extract_fast no disponible -> split completo",
+              flush=True)
 
     man = json.load(open(args.ids))
     ids = list(dict.fromkeys(man["train"] + man["val"]))
@@ -134,15 +170,23 @@ def main():
     for n, sid in enumerate(ids):
         t0 = time.time()
         S, L = load_pair(args.dataset, sid)
-        X, _ = split_2d(S.astype(np.float64), CROSS)
-        X = np.asarray(X, dtype=np.float32)
-        X[~np.isfinite(X)] = 0.0
-        Xs, ys, n_pos = build_pool(X, L, args.pool_k, args.max_pts, rng)
-        del X
+        # Plan the pool BEFORE splitting: split_2d does not touch the rng, so
+        # the draw order (and therefore the pool) is unchanged.
+        idx, n_pos = plan_pool_idx(L, args.pool_k, args.max_pts, rng)
+        if slow_split:
+            # Reference path: full matrix, then keep the pool rows.
+            X, _ = split_2d_loop(S.astype(np.float64), CROSS)
+            Xs = np.asarray(X, dtype=np.float32)[idx]
+        else:
+            # Only the pool rows are ever built (524288 -> ~6400 rows).
+            Xs, _ = split_2d_rows(S, idx, CROSS)
+            Xs = np.asarray(Xs, dtype=np.float32)
+        Xs[~np.isfinite(Xs)] = 0.0
+        ys = np.ascontiguousarray(L.reshape(-1, 1)[idx], dtype=np.float32)
         saver = np.savez_compressed if args.compress else np.savez
         saver(os.path.join(args.out, f"{sid}.npz"),
               X=np.ascontiguousarray(Xs, dtype=np.float32),
-              y=np.ascontiguousarray(ys, dtype=np.float32),
+              y=ys,
               n_pos=np.int32(n_pos),
               H=np.int32(SHAPE[0]), W=np.int32(SHAPE[1]))
         dt = time.time() - t0

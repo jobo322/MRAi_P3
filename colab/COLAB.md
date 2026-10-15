@@ -57,8 +57,8 @@ El `manifest.json` de `data/train_2d_elong/` NO se sube: apunta a
 | 2 — Stage data | Descomprime `dataset.zip` → `/content/dataset/`, `DNN_0.zip` → `/content/init/DNN_0`. |
 | 3 — Ingesta | `jres_ingest.py --validate-only` y luego ingesta real → `/content/staged/manifest.json` con `source=/content/dataset` (800 train / 200 val). |
 | 4 — Smoke test | `build_model().summary()` + 1 época `--max-pts 4096 --epochs 1` para validar I/O antes de gastar horas. |
-| 4b — Pre-extracción | `preextract.py --pool-k 10 --fast` → `/content/pre` (pool = positivos + 10×positivos de fondo). ~3,6 min medido, ~3,0 GB. Quita el `split_2d` de cada época y el fondo sigue variando. |
-| 5 — Fine-tune | `train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 ...` (~5-10 s/época). Ruta literal sin pre-extraer: `--data /content/staged` (~3,5 min/época en el Mac; más lento en la CPU del runtime de Colab). |
+| 4b — Pre-extracción | `preextract.py --pool-k 10 --fast` → `/content/pre` (pool = positivos + 10×positivos de fondo). **~11-16 s medido**, ~3,0 GB. Quita el `split_2d` de cada época y el fondo sigue variando. |
+| 5 — Fine-tune | `train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 ...` (~5-10 s/época). Ruta literal sin pre-extraer: `--data /content/staged` (~18 s/época en el Mac con el split por filas; más lento en la CPU del runtime de Colab). |
 | 5b — Reanudar | Solo tras corte. **`/content` se vacía al desconectarse**: re-ejecuta antes 1→2→3→4b. Renombra `training.log` → `training_part1.log` y relanza con `--data /content/pre --preextracted --resume $OUT/ckpt.keras` (pesos exactos). No re-ejecutes la celda 5: `--init` empezaría de cero. |
 | 6 — Export | Empaqueta `$OUT` (`ckpt.keras`, `*_savedmodel`, `history.*`, `training.log`) a zip en Drive para bajar al Mac y usar con `StoP3` sin cambios. |
 
@@ -67,7 +67,7 @@ python tools/verify_gpu.py
 python scripts/jres_ingest.py --dataset /content/dataset --out /content/staged --validate-only
 python scripts/jres_ingest.py --dataset /content/dataset --out /content/staged
 python scripts/train_model.py --data /content/staged --max-pts 4096 --epochs 1 --batch 4096 --out /content/smoke
-# pre-extraccion: pool de fondo (celda 4b), una vez, ~3,6 min
+# pre-extraccion: pool de fondo (celda 4b), una vez, ~11-16 s
 python scripts/preextract.py --dataset /content/dataset --ids /content/staged/manifest.json --out /content/pre --seed 0 --pool-k 10 --fast
 # fine-tune sobre pre-extraido (celda 5)
 python scripts/train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 --epochs 210 --patience 20 --out $OUT
@@ -96,17 +96,26 @@ Medido en el **Mac** (M1 CPU, sin GPU; `--batch 16384 --bg-ratio 2`,
 | Ruta | Coste/época | 30 épocas | ¿Fondo varía? |
 |------|-------------|-----------|---------------|
 | On-demand bucle (`--slow-split`) | ~12,7 min | ~6,4 h | ✓ |
-| **On-demand (default, vectorizado)** | ~3,5 min | ~1,8 h | ✓ |
-| **Pre-extraído pool `--pool-k 10`** | **~15 s** | **~7,5 min** (+3,6 min de pre-extracción) | ✓ |
+| **On-demand (default, split por filas)** | **~18 s** | **~9 min** | ✓ |
+| **Pre-extraído pool `--pool-k 10`** | **~15 s** | **~7,5 min** (+11-16 s de pre-extracción) | ✓ |
 
-El `~15 s/época` está medido en el run real de 15-oct (100 épocas en 24:32,
-85 steps/época). Proyectado en **Colab** (GPU NVIDIA; `--batch 65536
+El `~15 s/época` está medido en el run real de 15-oct (100 épocas en 24:32
+= 24 min 32 s → 14,7 s/época; consistente con los mtimes del run, ~56 min
+para ~171 épocas). Proyectado en **Colab** (GPU NVIDIA; `--batch 65536
 --bg-ratio 4` → `M` = 2905 puntos/espectro, 35 steps train / 8 val):
 
 | Ruta | Coste/época | 30 épocas | ¿Fondo varía? |
 |------|-------------|-----------|---------------|
-| On-demand (`--data /content/staged`) | ~3,5 min o más (CPU del runtime) | ~1,8 h+ | ✓ |
-| **Pre-extraído pool `--pool-k 10`** | **~5-10 s** | **~4-8 min** (+3,6 min) | ✓ |
+| On-demand (`--data /content/staged`) | ~18 s o más (CPU del runtime) | ~9 min+ | ✓ |
+| **Pre-extraído pool `--pool-k 10`** | **~5-10 s** | **~4-8 min** (+11-16 s) | ✓ |
+
+**Dónde está el coste (medido, 15-oct-2026).** El split por filas deja el
+prep de datos en ~3,4 s/época *on-demand* frente a ~0,8 s con el pool: ~20 %
+frente a ~5 % de una época de ~15 s. El cuello de botella pasó del prep al
+cómputo del modelo, así que la preextracción **ya no es obligatoria** — pero
+sigue pagándose sola: el *break-even* son ~4 épocas y en un run completo
+(171 épocas) ahorra ~7,6 min. El pool acota el fondo al 1,1 % de los píxeles
+(ver más abajo); si eso importa más que los ~2,7 s/época, usa on-demand.
 
 > `M` sale del **primer espectro de cada split** (`_points_per_spectrum` lee
 > el primer id): train → `0001`, 581 positivos → **2905**; val → 584 → 2920.
@@ -140,7 +149,7 @@ toma el pool entero (equivalente al muestreo fijo); verificado en
 
 Subir `pool_k` = más variedad de fondo y más disco. Referencias: disco del
 Mac 28 GB libres; Drive gratis 15 GB; Colab `/content` ~100 GB efímeros.
-El pool es **derivado**: se regenera desde `dataset.zip` en ~3,6 min, así que
+El pool es **derivado**: se regenera desde `dataset.zip` en ~15 s, así que
 no hace falta subirlo a Drive.
 
 **Límite honesto**: con `pool_k 10` el pool cubre 1.1% de los 523.707
@@ -167,6 +176,20 @@ por espectro con `--fast`). El pool es `pool_k ×` más grande que la muestra
 fija de las versiones previas de esta guía, así que el "~1,5 GB" que figuraba
 antes ya no aplica. npz sin comprimir: float32 no comprime, y comprimir cuesta
 26× al escribir y 12× al leer — medido.
+
+**Con `split_2d_rows` ese coste baja a ~11-16 s** (16,4 / 11,5 / 11,1 ms por
+espectro en 3 pasadas): antes se construía la matriz completa de 524288 filas
+y se conservaba el 1,2 %, ahora solo se calculan las filas del pool. La RAM
+pico por espectro baja de 1,39 GB a 0,17 GB.
+
+**Descartado y por qué (para no reabrir el debate):**
+
+| Alternativa | Resultado | Motivo |
+|---|---|---|
+| `multiprocessing` (2/4 workers) | 218 / 338 ms/esp vs 183 con 1 | *memory-bound*: cada worker escribe 537 MB y saturan el bus |
+| torch CPU fp64 | 241 ms/esp vs 143 de numpy | más lento; fp32 rompe la paridad (`maxdiff 2.98e-08`) |
+| torch MPS fp32 / fp64 | 240 ms/esp / **no existe** | PyTorch no implementa float64 en MPS |
+| GPU en Colab (T4) | peor en fp64 | ratio 1/32 frente a fp32 |
 
 ## 5. Estructura de `colab/`
 

@@ -30,9 +30,10 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 from cross_extract import split_2d as split_2d_loop
 try:  # vectorised, bit-identical (tests/test_cross_fast.py: maxdiff == 0.0)
-    from cross_extract_fast import split_2d_fast
+    from cross_extract_fast import split_2d_fast, split_2d_rows
     HAVE_FAST_SPLIT = True
 except ImportError:  # older checkout without the module
+    split_2d_rows = None
     HAVE_FAST_SPLIT = False
 
 SHAPE = (256, 2048)
@@ -121,8 +122,11 @@ class BinSequence:
         self.shuffle = shuffle
         self.bg_ratio = bg_ratio
         self.tf = tf
-        # fast por defecto: salida bit-idéntica (maxdiff 0.0), 6x más rápido
-        self.split_2d = split_2d_fast if (fast_split and HAVE_FAST_SPLIT) else split_2d_loop
+        # Por defecto solo se calculan las filas muestreadas (split_2d_rows,
+        # bit-identico, ~60x menos trabajo); --slow-split usa la matriz
+        # completa como referencia.
+        self.fast_split = bool(fast_split and HAVE_FAST_SPLIT)
+        self.split_2d = split_2d_fast if self.fast_split else split_2d_loop
 
     def _points_per_spectrum(self):
         """Puntos reales por espectro: positivos + bg_ratio fondo (cap max_pts).
@@ -164,9 +168,13 @@ class BinSequence:
         return np.ascontiguousarray(S), np.ascontiguousarray(L)
 
     def _points(self, S, L):
-        X, _ = self.split_2d(S.astype(np.float64), CROSS)
-        X = np.asarray(X, dtype=np.float32)
-        X[~np.isfinite(X)] = 0.0
+        """Muestrea los puntos del espectro (todos los positivos + fondo).
+
+        El plan de indices se calcula ANTES del split y el rng se consume en
+        el mismo orden que antes (choice -> shuffle), asi que la muestra no
+        cambia. Con fast_split solo se construyen las filas de `idx`
+        (split_2d_rows); la ruta lenta mantiene split_2d completo + X[idx].
+        """
         y = L.reshape(-1, 1)
         pos = np.where(y[:, 0] > 0.5)[0]
         n_bg = min(len(y) - len(pos), int(len(pos) * self.bg_ratio),
@@ -175,7 +183,14 @@ class BinSequence:
         take_neg = self.rng.choice(neg, size=max(0, n_bg), replace=False)
         idx = np.concatenate([pos, take_neg])
         self.rng.shuffle(idx)
-        return X[idx], y[idx]
+        if self.fast_split:
+            X, _ = split_2d_rows(S, idx, CROSS)
+            X = np.asarray(X, dtype=np.float32)
+        else:
+            X, _ = self.split_2d(S.astype(np.float64), CROSS)
+            X = np.asarray(X, dtype=np.float32)[idx]
+        X[~np.isfinite(X)] = 0.0
+        return X, y[idx]
 
     def _load_pre(self, sid):
         base = getattr(self, "pre_dir", None) or self.ds_dir
@@ -297,7 +312,8 @@ def main():
                           bg_ratio=args.bg_ratio,
                           fast_split=not args.slow_split)
     if not args.preextracted:
-        used = "bucle Python" if train_seq.split_2d is split_2d_loop else "vectorizado (6x)"
+        used = ("por filas (split_2d_rows)" if train_seq.fast_split
+                else "completo (--slow-split)")
         print(f"split_2d: {used}"
               + ("" if HAVE_FAST_SPLIT else "  [cross_extract_fast no disponible]"))
     if args.preextracted:
