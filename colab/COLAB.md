@@ -265,3 +265,69 @@ que alimenta a la GPU (`.prefetch(2)` solo amortigua 2 batches).
 batch (2 para X, 2 para y); ahora concatena una vez. Refactor sin cambio de
 salida (fijado por `tests/test_train_sync.py`), solo quita copias en CPU.
 
+## 8. Bug corregido: épocas vacías (se perdió la mitad del run)
+
+El run del 15-oct en `Trained/out_elong` declaró **210 épocas y solo entrenó
+105**: todas las impares tienen `acc = auc = loss = 0.0` y su `val_loss` se
+mueve ±5e-5 (solo ruido del remuestreo del fondo), frente a caídas de 0.2 en
+las pares.
+
+Causa, en Keras 3 (`keras/src/trainers/epoch_iterator.py`):
+
+```python
+if self._current_iterator is None or self.steps_per_epoch is None:
+    self._current_iterator = iter(self._get_iterator())
+```
+
+El iterador **solo** se recrea cuando es `None`, y el bloque que lo resetea al
+final de una época exige `self._num_batches` — que es `None` para un
+`from_generator` (cardinalidad desconocida). Con `steps_per_epoch=35`
+exactamente igual al número de batches que entrega el generador, el agotamiento
+cae justo en el límite de época: la siguiente arranca con el iterador muerto,
+hace 0 batches, emite `_interrupted_warning()` y **solo entonces** pone
+`_current_iterator = None`. De ahí que alterne en vez de morir del todo.
+
+El aviso de TF lo dice literalmente (visible al inicio del log de Colab):
+
+> UserWarning: Your input ran out of data; interrupting training. Make sure
+> that your dataset or generator can generate at least `steps_per_epoch *
+> epochs` batches. You may need to use the `.repeat()` function when building
+> your dataset.
+
+**Por qué el run viejo no lo tenía:** con `steps_per_epoch=800` (≫ 35 batches
+disponibles) Keras *tenía* que reiniciar el iterador a mitad de época, así que
+nunca llegaba al caso "agotado en el límite". Su `training.log` tiene 0 ceros
+en 171 épocas. El bug lo introdujo el arreglo de `_points_per_spectrum()`
+(§6): al corregir `steps_per_epoch` de 800 a 35 se alineó con el agotamiento.
+
+**Arreglo:**
+
+1. `BinSequence.to_dataset()` aplica `.repeat()` **antes** de `.prefetch(2)`.
+   El dataset pasa a ser infinito y `steps_per_epoch` gobierna la época en
+   solitario; cada vuelta de `repeat()` vuelve a llamar a `gen()`, así que
+   `__iter__` rebaraja con el rng y el fondo sigue variando.
+2. `make_step_guard(tf)` — callback que cuenta batches por época y **aborta**
+   con un `RuntimeError` claro si alguna hace 0. Va primero en la lista de
+   callbacks para que ningún otro escriba nada antes de fallar.
+
+**Verificado:** 12 tests en `tests/test_train_epoch_boundary.py` (el
+`.repeat()` se comprueba con un `tf` falso que registra las transformaciones;
+el guard es lógica pura sin TF).
+
+## 9. Resultado del run del 15-oct (`Trained/out_elong`)
+
+| | Viejo (on-demand) | Nuevo (`--preextracted`) |
+|---|---|---|
+| Épocas con entrenamiento real | 171 / 171 (100 %) | **105 / 210 (50 %)** |
+| Mejor `val_loss` | 0.052119 | 0.054100 |
+| `val_acc` / `val_auc` | 0.983332 / 0.997033 | 0.982519 / 0.995428 |
+
+`val_loss` por bloques de 42 épocas: 0.176 → 0.079 → 0.065 → 0.059 → 0.0557.
+Descenso monótono hasta el final (**mejor época 206 de 209**), así que el run
+quedó corto: `--patience 20` nunca disparó porque seguía mejorando.
+`history.npy` / `history.txt` son consistentes con `training.log`.
+
+La calidad es equiparable al run viejo con ~60 % de las épocas de datos
+distintos, lo que dice bien del pipeline del pool — pero **hay que re-lanzar**
+con el arreglo de §8 para aprovechar las 210 épocas completas.
+

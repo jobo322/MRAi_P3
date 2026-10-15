@@ -229,12 +229,27 @@ class BinSequence:
                 yield Xc, yc
 
     def to_dataset(self):
+        """Dataset infinito: `steps_per_epoch` gobierna la duracion de epoca.
+
+        `.repeat()` NO es opcional. Keras 3 (epoch_iterator.py) solo recrea el
+        iterador cuando `_current_iterator is None`, y el bloque que lo resetea
+        al final de una epoca exige `self._num_batches`, que es None para un
+        `from_generator` (cardinalidad desconocida). Sin `.repeat()`, un
+        generador que se agota justo en el limite de epoca deja un iterador
+        muerto: la epoca siguiente hace 0 batches, todas las metricas salen
+        0.0 y solo aparece un UserWarning (paso en el run del 15-oct-2026:
+        105 de 210 epocas sin entrenar). Con `.repeat()` el dataset es
+        infinito y el agotamiento no puede ocurrir; cada vuelta de `repeat()`
+        llama otra vez a `gen()`, asi que `__iter__` rebaraja con el rng y el
+        fondo sigue variando entre epocas.
+        """
         def gen():
             yield from self.__iter__()
         return self.tf.data.Dataset.from_generator(
             gen, output_signature=(
                 self.tf.TensorSpec(shape=(None, 128, 1), dtype=self.tf.float32),
-                self.tf.TensorSpec(shape=(None, 1), dtype=self.tf.float32))).prefetch(2)
+                self.tf.TensorSpec(shape=(None, 1), dtype=self.tf.float32))
+        ).repeat().prefetch(2)
 
 
 class _Syncer:
@@ -296,6 +311,60 @@ def make_drive_sync(tf, src, dst, every=5,
             syncer.sync()
 
     return DriveSync()
+
+
+class _StepGuard:
+    """Cuenta batches por epoca y detecta epocas que no entrenan nada.
+
+    Red de seguridad del fallo del 15-oct-2026: cuando el generador se agotaba
+    en el limite de epoca, Keras arrancaba la siguiente con un iterador muerto
+    y la epoca hacia 0 batches. Todas las metricas de train salian 0.0 y el
+    unico aviso era un UserWarning, asi que se perdio la mitad del computo
+    (105 de 210 epocas) sin que se notara. `to_dataset()` lo arregla con
+    `.repeat()`; esto convierte cualquier recaida en un error inmediato.
+    """
+
+    def __init__(self):
+        self.seen = 0
+        self.epoch = None
+
+    def on_epoch_begin(self, epoch):
+        self.epoch = epoch
+        self.seen = 0
+
+    def on_train_batch_end(self, batch):
+        self.seen += 1
+
+    def check(self):
+        """Mensaje de error si la epoca no entreno nada, o None si esta bien."""
+        if self.seen == 0:
+            return (
+                f"epoca {self.epoch}: 0 batches de entrenamiento. El generador "
+                "se agoto en el limite de epoca y Keras no recreo el iterador "
+                "(keras/src/trainers/epoch_iterator.py). Revisa "
+                "BinSequence.to_dataset(): necesita .repeat() antes de "
+                ".prefetch() para que steps_per_epoch gobierne la epoca."
+            )
+        return None
+
+
+def make_step_guard(tf):
+    """Callback de Keras que aborta si una epoca no entrena nada."""
+    guard = _StepGuard()
+
+    class StepGuard(tf.keras.callbacks.Callback):
+        def on_epoch_begin(self, epoch, logs=None):
+            guard.on_epoch_begin(epoch)
+
+        def on_train_batch_end(self, batch, logs=None):
+            guard.on_train_batch_end(batch)
+
+        def on_epoch_end(self, epoch, logs=None):
+            problem = guard.check()
+            if problem:
+                raise RuntimeError(problem)
+
+    return StepGuard()
 
 
 def main():
@@ -401,6 +470,9 @@ def main():
     if args.scratch:
         os.makedirs(ckpt_dir, exist_ok=True)
     cbs = [
+        # El guard va primero: si una epoca no entrena nada, aborta antes de
+        # que los demas callbacks escriban checkpoint o log.
+        make_step_guard(tf),
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience,
                                          restore_best_weights=True),
         tf.keras.callbacks.ModelCheckpoint(

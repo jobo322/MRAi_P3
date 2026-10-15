@@ -564,3 +564,53 @@ notebook                -> JSON válido, 19 celdas
   consecutivos del stream de muestras y el batch parcial final se descarta.
 - Sin `--scratch` el comportamiento es idéntico al anterior (escribir en
   `--out`), así que no rompe nada existente.
+
+---
+
+## 16. Bug corregido: la mitad del run sin entrenar (Keras 3 + from_generator)
+
+Detectado al revisar `Trained/out_elong`, el run de Colab del 15-oct-2026.
+
+### Síntoma
+
+210 épocas declaradas, **105 sin entrenar**: todas las impares con
+`acc = auc = loss = 0.0` y `val_loss` moviéndose ±5e-5 (ruido del remuestreo
+del fondo) frente a caídas de 0.2 en las pares.
+
+### Causa
+
+`keras/src/trainers/epoch_iterator.py` solo recrea el iterador cuando
+`_current_iterator is None`, y el reset de fin de época exige
+`self._num_batches`, que es `None` para un `from_generator`. Con
+`steps_per_epoch=35` == batches por ciclo del generador, el agotamiento cae en
+el límite de época: la siguiente arranca con el iterador muerto, hace 0
+batches, emite `_interrupted_warning()` y solo entonces lo pone a `None`. De
+ahí la alternancia.
+
+Lo introdujo el arreglo de `_points_per_spectrum()` (§14.2): al pasar
+`steps_per_epoch` de 800 a 35 se alineó con el agotamiento. El run viejo
+(`steps_per_epoch=800`) no lo tiene — 0 ceros en 171 épocas.
+
+### Cambios
+
+| Fichero | Cambio |
+|---|---|
+| `scripts/train_model.py` | `to_dataset()` aplica `.repeat()` antes de `.prefetch(2)` |
+| `scripts/train_model.py` | `_StepGuard` + `make_step_guard(tf)`: aborta si una época hace 0 batches; va primero en la lista de callbacks |
+| `tests/test_train_epoch_boundary.py` | **nuevo**, 12 tests |
+| `colab/COLAB.md` §8-§9 | bug y revisión del run documentados |
+
+### Evidencia
+
+```
+pytest tests/ -q  -> 64 passed, 3 skipped  (+12 nuevos)
+```
+
+### Lección
+
+Un fallo que degrada en silencio (métricas a 0.0 y un UserWarning entre miles
+de líneas) cuesta más que uno que revienta: aquí se tiró la mitad del cómputo
+de un run de Colab. El guard existe para que la próxima recaída sea ruidosa.
+Y el disparador fue un arreglo *correcto* (§14.2) que alineó
+dos cantidades por accidente: cuando se corrige `steps_per_epoch`, hay que
+comprobar la interacción con el agotamiento del generador.
