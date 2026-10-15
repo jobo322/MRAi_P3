@@ -9,6 +9,11 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# Packaging build leftovers (python -m build)
+build/
+dist/
+*.egg-info/
+
 # Large local data / generated artifacts (regenerable, not versioned)
 data/
 Trained copy/

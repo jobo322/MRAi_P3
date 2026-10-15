@@ -34,7 +34,7 @@ conda activate mrai_p3
 ```
 7. Install `MRAi_P3` with:
 ```python
-pip install MRAi_P3-1.0.0-py3-none-any.whl
+pip install mrai_p3-1.1.2-py3-none-any.whl
 ```
 * Installation may take a few minutes.
   
@@ -78,7 +78,7 @@ python -m pip install --upgrade pip setuptools wheel
 pip install tensorflow       # >=2.13  ✓ arm64
 
 # 4. install MRAi_P3 from the patched wheel for TensorFlow 2.15+ / Keras 3
-pip install ~/git/mrai_p3/MRAi_P3-1.1.1-py3-none-any.whl
+pip install ~/git/mrai_p3/mrai_p3-1.1.2-py3-none-any.whl
 
 # 5. install Jupyter (optional, for notebooks)
 pip install jupyter
@@ -98,7 +98,7 @@ conda activate mrai_p3
 pip install tensorflow
 
 # install MRAi_P3 from the patched wheel for TensorFlow 2.15+ / Keras 3
-pip install /full/path-to/MRAi_P3-1.1.1-py3-none-any.whl
+pip install /full/path-to/mrai_p3-1.1.2-py3-none-any.whl
 
 # Jupyter
 conda install jupyter -y
@@ -135,15 +135,21 @@ This means `MRAi_P3` is not compatible with your machine (e.g. Apple Silicon M-s
 
 ---
 
-## Compatibility Notes (v1.1.1)
+## Compatibility Notes (v1.1.2)
 
-The `MRAi_P3-1.1.1` wheel includes patches for **TensorFlow 2.15+ / Keras 3**:
+The `mrai_p3-1.1.2` wheel supersedes the hand-built `1.1.1` and carries the
+patches for **TensorFlow 2.15+ / Keras 3** introduced there, plus one fix:
 
 1. **SavedModel loading** — `tf.keras.models.load_model()` is replaced with `tf.keras.layers.TFSMLayer` wrapped in a `Sequential` model, since Keras 3 no longer supports the legacy SavedModel directory format.
 
 2. **`model.predict()` output** — Keras 3 `TFSMLayer.predict()` returns a dict (e.g., `{'dense_14': array}`), so the output key is now extracted before assignment.
 
 3. **NMRPipe `showhdr` fallback** — When NMRPipe's `showhdr` binary is not installed, `P5toPeaks.py` and `PeakstoTab.py` fall back to `nmrglue` to extract spectrum metadata (dimension count, nucleus labels, PPM ranges, sweep widths) from the Pipe dictionary.
+
+4. **NMRPipe dimension mapping (new in 1.1.2)** — `showhdr` prints its axis columns in *display* order, i.e. the reverse of NMRPipe's 1..ND. Keying by column index therefore assigned the F2 values to dimension 1. `headers.read_headers()` now reads the `ORDER:` header and routes column *i* to dimension `order[i]`, falling back to the legacy 1..ND order when `ORDER:` is absent. `headers.py` is a shared module imported by `P5toPeaks.py` and `PeakstoTab.py`.
+
+> The `1.1.1` and earlier wheels do **not** contain `headers.py` and predate
+> fix 4. Use `mrai_p3-1.1.2-py3-none-any.whl`.
 
 ---
 
