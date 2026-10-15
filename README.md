@@ -176,6 +176,12 @@ jupyter notebook
 
 ---
 
+## Training the Model Locally (Retraining Pipeline)
+
+To retrain/fine-tune the 2D-US peak-probability model on your own machine — background-pool pre-extraction (`scripts/preextract.py`) followed by the full 210-epoch run (`scripts/train_model.py`) — follow the validated step-by-step guide in [docs/local_training.md](docs/local_training.md). The same pipeline on a Colab GPU is documented in [colab/COLAB.md](colab/COLAB.md).
+
+---
+
 ## Uninstallation
 If it is needed to uninstall the entire environment, open a terminal in the `base` Conda environment and remove the `mrai_p3` environment with:
 ```python
