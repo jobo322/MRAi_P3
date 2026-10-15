@@ -21,6 +21,7 @@ Uso:
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 
@@ -216,11 +217,14 @@ class BinSequence:
             buf_y.append(y)
             have += len(X)
             while have >= self.batch:
-                Xc = np.concatenate(buf_x)[:self.batch]
-                yc = np.concatenate(buf_y)[:self.batch]
-                rest_x = np.concatenate(buf_x)[self.batch:]
-                rest_y = np.concatenate(buf_y)[self.batch:]
-                buf_x, buf_y = ([rest_x] if len(rest_x) else []), ([rest_y] if len(rest_y) else [])
+                # Un solo concatenate por buffer: antes se concatenaba dos
+                # veces cada uno (Xc y rest_x salian de arrays distintos).
+                all_x = np.concatenate(buf_x)
+                all_y = np.concatenate(buf_y)
+                Xc, rest_x = all_x[:self.batch], all_x[self.batch:]
+                yc, rest_y = all_y[:self.batch], all_y[self.batch:]
+                buf_x = [rest_x] if len(rest_x) else []
+                buf_y = [rest_y] if len(rest_y) else []
                 have = len(rest_x)
                 yield Xc, yc
 
@@ -231,6 +235,67 @@ class BinSequence:
             gen, output_signature=(
                 self.tf.TensorSpec(shape=(None, 128, 1), dtype=self.tf.float32),
                 self.tf.TensorSpec(shape=(None, 1), dtype=self.tf.float32))).prefetch(2)
+
+
+class _Syncer:
+    """Copia local -> destino cada N epocas, sin depender de TensorFlow.
+
+    Escribir en Drive cuesta entre 0,3 y 20 s por epoca (es una API de red
+    montada como sistema de ficheros), y esa varianza domina el tiempo de
+    epoca cuando el computo son ~2 s: el entrenamiento oscilaba entre 1 s y
+    20 s por epoca con el step constante. Aqui el entrenamiento escribe en
+    un directorio local (--scratch) y esto lo copia al destino cada `every`
+    epocas, asi que el I/O variable sale del bucle de epocas sin perder la
+    red de seguridad frente al reciclaje de la VM de Colab.
+
+    La copia es atomica (fichero temporal + os.replace) para que un corte a
+    mitad de escritura no deje un checkpoint truncado en Drive.
+    """
+
+    def __init__(self, src, dst, every=5,
+                 files=("ckpt.keras", "training.log")):
+        self.src = src
+        self.dst = dst
+        self.every = max(1, int(every))
+        self.files = tuple(files)
+
+    def due(self, epoch):
+        """Toca sincronizar al terminar esta epoca? (epoch es 0-based)."""
+        return (int(epoch) + 1) % self.every == 0
+
+    def maybe_sync(self, epoch):
+        if self.due(epoch):
+            self.sync()
+
+    def sync(self):
+        os.makedirs(self.dst, exist_ok=True)
+        for name in self.files:
+            src = os.path.join(self.src, name)
+            if not os.path.isfile(src):
+                continue  # p.ej. aun no hay ckpt con save_best_only
+            dst = os.path.join(self.dst, name)
+            tmp = dst + ".tmp"
+            shutil.copy2(src, tmp)
+            os.replace(tmp, dst)
+
+
+def make_drive_sync(tf, src, dst, every=5,
+                    files=("ckpt.keras", "training.log")):
+    """Callback de Keras que envuelve `_Syncer`.
+
+    Se construye con una fabrica porque este modulo importa TensorFlow de
+    forma perezosa (tests/ lo importa sin TF instalado).
+    """
+    syncer = _Syncer(src, dst, every, files)
+
+    class DriveSync(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            syncer.maybe_sync(epoch)
+
+        def on_train_end(self, logs=None):
+            syncer.sync()
+
+    return DriveSync()
 
 
 def main():
@@ -259,6 +324,12 @@ def main():
     ap.add_argument("--slow-split", action="store_true",
                     help="usar el split_2d con bucle Python (referencia "
                          "bit-idéntica); por defecto se usa el vectorizado 6x")
+    ap.add_argument("--scratch", default=None, metavar="DIR",
+                    help="escribir checkpoints y log aqui (local) y copiarlos "
+                         "a --out cada --sync-every epocas; evita el I/O "
+                         "variable de Drive en el bucle de entrenamiento")
+    ap.add_argument("--sync-every", type=int, default=5,
+                    help="cada cuantas epocas copiar --scratch a --out (5)")
     args = ap.parse_args()
 
     import tensorflow as tf
@@ -325,14 +396,24 @@ def main():
               f"(seed={man.get('seed')}, pool_k={man.get('pool_k')}, "
               f"bg_ratio/época={args.bg_ratio})")
     os.makedirs(args.out, exist_ok=True)
+    # --scratch: el entrenamiento escribe en local y se sincroniza a --out.
+    ckpt_dir = args.scratch or args.out
+    if args.scratch:
+        os.makedirs(ckpt_dir, exist_ok=True)
     cbs = [
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience,
                                          restore_best_weights=True),
         tf.keras.callbacks.ModelCheckpoint(
-            os.path.join(args.out, "ckpt.keras"), monitor="val_loss",
+            os.path.join(ckpt_dir, "ckpt.keras"), monitor="val_loss",
             save_best_only=True),
-        tf.keras.callbacks.CSVLogger(os.path.join(args.out, "training.log")),
+        tf.keras.callbacks.CSVLogger(os.path.join(ckpt_dir, "training.log")),
     ]
+    if args.scratch:
+        # Despues de ModelCheckpoint/CSVLogger para que los ficheros existan.
+        cbs.append(make_drive_sync(tf, ckpt_dir, args.out,
+                                   every=args.sync_every))
+        print(f"checkpoints en {ckpt_dir}; sincronizados a {args.out} "
+              f"cada {max(1, args.sync_every)} epocas")
     t0 = time.time()
     n_val_steps = max(1, len(val_seq))
     hist = model.fit(train_seq.to_dataset(), validation_data=val_seq.to_dataset(),

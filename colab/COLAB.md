@@ -58,7 +58,7 @@ El `manifest.json` de `data/train_2d_elong/` NO se sube: apunta a
 | 3 — Ingesta | `jres_ingest.py --validate-only` y luego ingesta real → `/content/staged/manifest.json` con `source=/content/dataset` (800 train / 200 val). |
 | 4 — Smoke test | `build_model().summary()` + 1 época `--max-pts 4096 --epochs 1` para validar I/O antes de gastar horas. |
 | 4b — Pre-extracción | `preextract.py --pool-k 10 --fast` → `/content/pre` (pool = positivos + 10×positivos de fondo). **~11-16 s medido**, ~3,0 GB. Quita el `split_2d` de cada época y el fondo sigue variando. |
-| 5 — Fine-tune | `train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 ...` (~5-10 s/época). Ruta literal sin pre-extraer: `--data /content/staged` (~18 s/época en el Mac con el split por filas; más lento en la CPU del runtime de Colab). |
+| 5 — Fine-tune | `train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 --scratch /content/out --sync-every 5 ...` (~2 s/época de cómputo; el `--scratch` quita el I/O variable de Drive, ver §7). Ruta literal sin pre-extraer: `--data /content/staged` (~18 s/época en el Mac con el split por filas; más lento en la CPU del runtime de Colab). |
 | 5b — Reanudar | Solo tras corte. **`/content` se vacía al desconectarse**: re-ejecuta antes 1→2→3→4b. Renombra `training.log` → `training_part1.log` y relanza con `--data /content/pre --preextracted --resume $OUT/ckpt.keras` (pesos exactos). No re-ejecutes la celda 5: `--init` empezaría de cero. |
 | 6 — Export | Empaqueta `$OUT` (`ckpt.keras`, `*_savedmodel`, `history.*`, `training.log`) a zip en Drive para bajar al Mac y usar con `StoP3` sin cambios. |
 
@@ -69,10 +69,11 @@ python scripts/jres_ingest.py --dataset /content/dataset --out /content/staged
 python scripts/train_model.py --data /content/staged --max-pts 4096 --epochs 1 --batch 4096 --out /content/smoke
 # pre-extraccion: pool de fondo (celda 4b), una vez, ~11-16 s
 python scripts/preextract.py --dataset /content/dataset --ids /content/staged/manifest.json --out /content/pre --seed 0 --pool-k 10 --fast
-# fine-tune sobre pre-extraido (celda 5)
-python scripts/train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 --epochs 210 --patience 20 --out $OUT
+# fine-tune sobre pre-extraido (celda 5). --scratch: escribe en local y
+# sincroniza a $OUT cada 5 epocas (ver §7)
+python scripts/train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 --epochs 210 --patience 20 --out $OUT --scratch /content/out --sync-every 5
 # reanudar tras corte (celda 5b): ckpt + log ya están en Drive
-python scripts/train_model.py --data /content/pre --preextracted --resume $OUT/ckpt.keras --lr 1e-4 --batch 65536 --bg-ratio 4 --epochs 210 --patience 20 --out $OUT
+python scripts/train_model.py --data /content/pre --preextracted --resume $OUT/ckpt.keras --lr 1e-4 --batch 65536 --bg-ratio 4 --epochs 210 --patience 20 --out $OUT --scratch /content/out --sync-every 5
 ```
 
 ## 4. Estimación de tiempos (medida real, 14-15 oct 2026)
@@ -223,4 +224,44 @@ a los 35, con barra de progreso engañosa. Se añadió
 **Implicación para replicar el paper**: la época efectiva es 35 steps
 (no 800). Si buscas un total de steps concreto, escala `--epochs`
 (p.ej. 35 steps × 30 épocas = 1.050 steps).
+
+## 7. Épocas de duración variable (1-20 s): el I/O de Drive
+
+Con `--batch 65536` la época son **35 steps** y el step es constante, pero
+la duración de época oscila entre 1 s y 20 s. La causa no es el batch: son
+los callbacks escribiendo en **Drive**.
+
+Drive es una API de red montada por FUSE, no un disco: cada escritura cuesta
+entre ~0,3 s y >20 s según el momento, y Colab la estrangula. Por época:
+
+- `CSVLogger` → abre/escribe/cierra `training.log` en Drive, **cada época**.
+- `ModelCheckpoint(save_best_only=True)` → escribe `ckpt.keras` (**273 KB**,
+  medido en `Trained/Probability_2D_Elongated/DNN_0/ckpt.keras`) en Drive
+  **cada vez que mejora `val_loss`**.
+
+Lo que se mide es entonces `cómputo (~2 s, estable) + I/O a Drive (0-20 s,
+variable)`. Predicción comprobable: la varianza debería **encogerse** según
+avanza el entrenamiento, porque `save_best_only=True` deja de escribir
+cuando `val_loss` se estanca.
+
+**Arreglo: `--scratch DIR --sync-every N`.** El entrenamiento escribe en un
+directorio local y un callback (`_Syncer` / `make_drive_sync`) copia
+`ckpt.keras` + `training.log` al destino cada N épocas (5 por defecto) y
+siempre al terminar. La copia es atómica (fichero temporal + `os.replace`)
+para que un corte a mitad de escritura no deje un checkpoint truncado en
+Drive.
+
+- Quita el I/O variable de las 210 épocas.
+- Conserva la red de seguridad: pierdes como mucho N épocas en un corte,
+  coherente con `--patience 20`.
+- Sin `--scratch` el comportamiento es el de siempre (escribir en `--out`).
+
+**Otras fuentes de varianza** (menores, no arregladas): warm-up de la 1ª
+época (tracing de `@tf.function`, autotuning de cuDNN, lectura en frío de
+los `.npz`), la T4 compartida de Colab free, y el generador Python en CPU
+que alimenta a la GPU (`.prefetch(2)` solo amortigua 2 batches).
+
+**Nota de paso:** `BinSequence.__iter__` concatenaba su buffer 4 veces por
+batch (2 para X, 2 para y); ahora concatena una vez. Refactor sin cambio de
+salida (fijado por `tests/test_train_sync.py`), solo quita copias en CPU.
 

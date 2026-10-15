@@ -521,3 +521,46 @@ es ese mismo test extendido a todo el dataset.
 4. **Guardas de import** en `preextract.py` y `train_model.py`
    (`HAVE_FAST_SPLIT`), siguiendo el patrón que ya usaba `train_model.py`:
    sin `cross_extract_fast` el CLI cae al split completo con un aviso.
+
+---
+
+## 15. Mejora posterior: I/O de Drive y batching
+
+No era parte de este plan. Aparece al responder «¿por qué las épocas duran
+entre 1 s y 20 s en Colab?», y va aquí para no dejar el hallazgo suelto.
+
+### Diagnóstico
+
+Con `--batch 65536` la época son 35 steps y el step es constante, así que la
+varianza **no** es del batch. Son los callbacks escribiendo en **Drive** (API
+de red por FUSE: 0,3-20 s por escritura): `CSVLogger` cada época, y
+`ModelCheckpoint(save_best_only=True)` con un `ckpt.keras` de **273 KB** cada
+vez que mejora `val_loss`. Lo que se mide es
+`cómputo (~2 s, estable) + I/O a Drive (0-20 s, variable)`.
+
+### Cambios
+
+| Fichero | Cambio |
+|---|---|
+| `scripts/train_model.py` | `_Syncer` (lógica de copia, sin TF) + `make_drive_sync` (adaptador Keras, construido por fábrica porque el módulo importa TF de forma perezosa); flags `--scratch DIR` y `--sync-every N`; copia atómica (tmp + `os.replace`) para no dejar un checkpoint truncado |
+| `scripts/train_model.py` | `BinSequence.__iter__` concatena el buffer **1 vez** por buffer en vez de 2 (4 en total) |
+| `tests/test_train_sync.py` | **nuevo**, 24 tests |
+| `colab/COLAB.md` §7, notebook celdas 13/14/16 | documentado y cableado |
+
+### Evidencia
+
+```
+pytest tests/ -q        -> 52 passed, 3 skipped  (+24 nuevos)
+byte-identity 1000 esp  -> 1000/1000, sin cambios
+diff scripts/ colab/    -> 5/5
+notebook                -> JSON válido, 19 celdas
+```
+
+### Notas
+
+- El adaptador de Keras se prueba con un `tf` falso (`_FakeCallback`), así que
+  `tests/` sigue sin necesitar TensorFlow instalado.
+- El invariante que fija el refactor del batching: los batches son cortes
+  consecutivos del stream de muestras y el batch parcial final se descarta.
+- Sin `--scratch` el comportamiento es idéntico al anterior (escribir en
+  `--out`), así que no rompe nada existente.
