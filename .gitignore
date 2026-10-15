@@ -1,2 +1,15 @@
 # Local Pi runtime state
 .atl/
+
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Large local data / generated artifacts (regenerable, not versioned)
+data/
+Trained copy/
+docs/*.pdf
