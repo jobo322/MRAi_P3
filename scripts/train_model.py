@@ -86,6 +86,23 @@ def build_model(filter_n=10):
     return tf.keras.Model(inputs=inp, outputs=out)
 
 
+def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng):
+    """Muestreo por época desde un pool pre-extraído.
+
+    Toma TODOS los positivos (filas 0:n_pos) + `bg_ratio * n_pos` filas de
+    fondo elegidas al azar del pool (filas n_pos:). Como el pool tiene
+    `pool_k * n_pos` filas de fondo, con pool_k > bg_ratio cada época ve un
+    subconjunto distinto -> se conserva la aumentación de fondo sin volver a
+    pagar split_2d. Si pool_k == bg_ratio se toman todas las filas del pool
+    (equivalente al muestreo fijo; ver tests/test_pool_equiv.py).
+    """
+    n_bg = min(len(X) - n_pos, int(n_pos * bg_ratio), max_pts - n_pos)
+    bg = rng.choice(len(X) - n_pos, size=max(0, n_bg), replace=False) + n_pos
+    idx = np.concatenate([np.arange(n_pos), bg])
+    rng.shuffle(idx)
+    return X[idx], y[idx]
+
+
 class BinSequence:
     """Generador de batches: memmap .bin + split_2d bajo demanda.
 
@@ -121,7 +138,14 @@ class BinSequence:
         if getattr(self, "preextracted", False):
             base = getattr(self, "pre_dir", None) or self.ds_dir
             with np.load(os.path.join(base, f"{sid}.npz")) as z:
-                return max(1, int(z["X"].shape[0]))
+                total = int(z["X"].shape[0])
+                n_pos = int(z["n_pos"]) if "n_pos" in z else None
+            if n_pos is None:  # formato antiguo: la muestra es el fichero
+                return max(1, total)
+            # pool: lo que se entrena por época es el submuestreo, no el pool
+            n_bg = min(total - n_pos, int(n_pos * self.bg_ratio),
+                       self.max_pts - n_pos)
+            return max(1, n_pos + n_bg)
         L = np.memmap(os.path.join(self.ds_dir, "labels", f"{sid}.bin"),
                       dtype=np.uint8, mode="r", shape=SHAPE).astype(np.float32)
         npos = int((L.reshape(-1) > 0.5).sum())
@@ -155,8 +179,14 @@ class BinSequence:
 
     def _load_pre(self, sid):
         base = getattr(self, "pre_dir", None) or self.ds_dir
-        z = np.load(os.path.join(base, f"{sid}.npz"))
-        return np.ascontiguousarray(z["X"]), np.ascontiguousarray(z["y"])
+        with np.load(os.path.join(base, f"{sid}.npz")) as z:
+            X, y = z["X"], z["y"]
+            n_pos = int(z["n_pos"]) if "n_pos" in z else None
+        if n_pos is None:  # formato antiguo: muestra fija, ya es final
+            return np.ascontiguousarray(X), np.ascontiguousarray(y)
+        Xs, ys = subsample_pool(X, y, n_pos, self.max_pts, self.bg_ratio,
+                                self.rng)
+        return np.ascontiguousarray(Xs), np.ascontiguousarray(ys)
 
     def __iter__(self):
         order = self.rng.permutation(len(self.ids)) if self.shuffle else np.arange(len(self.ids))
@@ -208,8 +238,9 @@ def main():
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--preextracted", action="store_true",
-                    help="leer (X,y) fijos de preextract.py (<id>.npz) en vez "
-                         "de .bin + split_2d bajo demanda")
+                    help="leer el pool pre-extraido de preextract.py "
+                         "(<id>.npz) en vez de .bin + split_2d bajo demanda; "
+                         "el fondo se submuestrea por epoca con --bg-ratio")
     ap.add_argument("--slow-split", action="store_true",
                     help="usar el split_2d con bucle Python (referencia "
                          "bit-idéntica); por defecto se usa el vectorizado 6x")
@@ -275,7 +306,8 @@ def main():
         train_seq.pre_dir = args.data
         val_seq.pre_dir = args.data
         print(f"modo pre-extraído: {man.get('storage', '')} "
-              f"(seed={man.get('seed')}, bg_ratio={man.get('bg_ratio')})")
+              f"(seed={man.get('seed')}, pool_k={man.get('pool_k')}, "
+              f"bg_ratio/época={args.bg_ratio})")
     os.makedirs(args.out, exist_ok=True)
     cbs = [
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience,

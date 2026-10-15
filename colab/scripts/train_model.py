@@ -28,7 +28,12 @@ import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
-from cross_extract import split_2d
+from cross_extract import split_2d as split_2d_loop
+try:  # vectorised, bit-identical (tests/test_cross_fast.py: maxdiff == 0.0)
+    from cross_extract_fast import split_2d_fast
+    HAVE_FAST_SPLIT = True
+except ImportError:  # older checkout without the module
+    HAVE_FAST_SPLIT = False
 
 SHAPE = (256, 2048)
 CROSS = np.array([64, 64])
@@ -81,6 +86,23 @@ def build_model(filter_n=10):
     return tf.keras.Model(inputs=inp, outputs=out)
 
 
+def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng):
+    """Muestreo por época desde un pool pre-extraído.
+
+    Toma TODOS los positivos (filas 0:n_pos) + `bg_ratio * n_pos` filas de
+    fondo elegidas al azar del pool (filas n_pos:). Como el pool tiene
+    `pool_k * n_pos` filas de fondo, con pool_k > bg_ratio cada época ve un
+    subconjunto distinto -> se conserva la aumentación de fondo sin volver a
+    pagar split_2d. Si pool_k == bg_ratio se toman todas las filas del pool
+    (equivalente al muestreo fijo; ver tests/test_pool_equiv.py).
+    """
+    n_bg = min(len(X) - n_pos, int(n_pos * bg_ratio), max_pts - n_pos)
+    bg = rng.choice(len(X) - n_pos, size=max(0, n_bg), replace=False) + n_pos
+    idx = np.concatenate([np.arange(n_pos), bg])
+    rng.shuffle(idx)
+    return X[idx], y[idx]
+
+
 class BinSequence:
     """Generador de batches: memmap .bin + split_2d bajo demanda.
 
@@ -89,7 +111,7 @@ class BinSequence:
     """
 
     def __init__(self, ds_dir, ids, batch=65536, max_pts=65536, seed=0,
-                 shuffle=True, bg_ratio=4.0):
+                 shuffle=True, bg_ratio=4.0, fast_split=True):
         import tensorflow as tf
         self.ds_dir = ds_dir
         self.ids = list(ids)
@@ -99,6 +121,8 @@ class BinSequence:
         self.shuffle = shuffle
         self.bg_ratio = bg_ratio
         self.tf = tf
+        # fast por defecto: salida bit-idéntica (maxdiff 0.0), 6x más rápido
+        self.split_2d = split_2d_fast if (fast_split and HAVE_FAST_SPLIT) else split_2d_loop
 
     def _points_per_spectrum(self):
         """Puntos reales por espectro: positivos + bg_ratio fondo (cap max_pts).
@@ -114,7 +138,14 @@ class BinSequence:
         if getattr(self, "preextracted", False):
             base = getattr(self, "pre_dir", None) or self.ds_dir
             with np.load(os.path.join(base, f"{sid}.npz")) as z:
-                return max(1, int(z["X"].shape[0]))
+                total = int(z["X"].shape[0])
+                n_pos = int(z["n_pos"]) if "n_pos" in z else None
+            if n_pos is None:  # formato antiguo: la muestra es el fichero
+                return max(1, total)
+            # pool: lo que se entrena por época es el submuestreo, no el pool
+            n_bg = min(total - n_pos, int(n_pos * self.bg_ratio),
+                       self.max_pts - n_pos)
+            return max(1, n_pos + n_bg)
         L = np.memmap(os.path.join(self.ds_dir, "labels", f"{sid}.bin"),
                       dtype=np.uint8, mode="r", shape=SHAPE).astype(np.float32)
         npos = int((L.reshape(-1) > 0.5).sum())
@@ -133,7 +164,7 @@ class BinSequence:
         return np.ascontiguousarray(S), np.ascontiguousarray(L)
 
     def _points(self, S, L):
-        X, _ = split_2d(S.astype(np.float64), CROSS)
+        X, _ = self.split_2d(S.astype(np.float64), CROSS)
         X = np.asarray(X, dtype=np.float32)
         X[~np.isfinite(X)] = 0.0
         y = L.reshape(-1, 1)
@@ -148,8 +179,14 @@ class BinSequence:
 
     def _load_pre(self, sid):
         base = getattr(self, "pre_dir", None) or self.ds_dir
-        z = np.load(os.path.join(base, f"{sid}.npz"))
-        return np.ascontiguousarray(z["X"]), np.ascontiguousarray(z["y"])
+        with np.load(os.path.join(base, f"{sid}.npz")) as z:
+            X, y = z["X"], z["y"]
+            n_pos = int(z["n_pos"]) if "n_pos" in z else None
+        if n_pos is None:  # formato antiguo: muestra fija, ya es final
+            return np.ascontiguousarray(X), np.ascontiguousarray(y)
+        Xs, ys = subsample_pool(X, y, n_pos, self.max_pts, self.bg_ratio,
+                                self.rng)
+        return np.ascontiguousarray(Xs), np.ascontiguousarray(ys)
 
     def __iter__(self):
         order = self.rng.permutation(len(self.ids)) if self.shuffle else np.arange(len(self.ids))
@@ -201,8 +238,12 @@ def main():
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--preextracted", action="store_true",
-                    help="leer (X,y) fijos de preextract.py (<id>.npz) en vez "
-                         "de .bin + split_2d bajo demanda")
+                    help="leer el pool pre-extraido de preextract.py "
+                         "(<id>.npz) en vez de .bin + split_2d bajo demanda; "
+                         "el fondo se submuestrea por epoca con --bg-ratio")
+    ap.add_argument("--slow-split", action="store_true",
+                    help="usar el split_2d con bucle Python (referencia "
+                         "bit-idéntica); por defecto se usa el vectorizado 6x")
     args = ap.parse_args()
 
     import tensorflow as tf
@@ -249,17 +290,24 @@ def main():
     print(f"subset: {len(train_ids)} train / {len(val_ids)} val")
     train_seq = BinSequence(ds_dir, train_ids, batch=args.batch,
                             max_pts=args.max_pts, seed=args.seed, shuffle=True,
-                            bg_ratio=args.bg_ratio)
+                            bg_ratio=args.bg_ratio,
+                            fast_split=not args.slow_split)
     val_seq = BinSequence(ds_dir, val_ids, batch=args.batch,
                           max_pts=args.max_pts, seed=args.seed + 1, shuffle=False,
-                          bg_ratio=args.bg_ratio)
+                          bg_ratio=args.bg_ratio,
+                          fast_split=not args.slow_split)
+    if not args.preextracted:
+        used = "bucle Python" if train_seq.split_2d is split_2d_loop else "vectorizado (6x)"
+        print(f"split_2d: {used}"
+              + ("" if HAVE_FAST_SPLIT else "  [cross_extract_fast no disponible]"))
     if args.preextracted:
         train_seq.preextracted = True
         val_seq.preextracted = True
         train_seq.pre_dir = args.data
         val_seq.pre_dir = args.data
         print(f"modo pre-extraído: {man.get('storage', '')} "
-              f"(seed={man.get('seed')}, bg_ratio={man.get('bg_ratio')})")
+              f"(seed={man.get('seed')}, pool_k={man.get('pool_k')}, "
+              f"bg_ratio/época={args.bg_ratio})")
     os.makedirs(args.out, exist_ok=True)
     cbs = [
         tf.keras.callbacks.EarlyStopping(monitor="val_loss", patience=args.patience,
