@@ -251,5 +251,123 @@ class TestHeadersFallback(unittest.TestCase):
         self.assertTrue(callable(headers.read_headers))
 
 
+class TestHeadersShowhdrRoute(unittest.TestCase):
+    """Tests for the `showhdr -verb` primary route (docs follow-up #4).
+
+    These only run when NMRPipe's `showhdr` is reachable on PATH; otherwise
+    every test is skipped. The critical invariant is that both routes return
+    the *same* canonical six-tuple, because showhdr prints its axis columns in
+    display order (X, Y == FDF2, FDF1) whereas the nmrglue fallback keys by
+    NMRPipe dimension. A mismatch silently transposes .peaks/.tab output.
+    """
+
+    SPECTRA = [AZURIN_FT2, TAU_FT2, UBIQUITIN_FT2, MALT_FT2]
+
+    @staticmethod
+    def _showhdr_available():
+        return shutil.which("showhdr") is not None
+
+    @staticmethod
+    def _forced_fallback(path):
+        """Read headers through the nmrglue fallback regardless of PATH."""
+        orig = headers.subprocess.check_output
+
+        def _raise(*a, **kw):
+            raise FileNotFoundError("showhdr hidden (test forced)")
+
+        headers.subprocess.check_output = _raise
+        try:
+            return headers.read_headers(path)
+        finally:
+            headers.subprocess.check_output = orig
+
+    def setUp(self):
+        if not self._showhdr_available():
+            raise unittest.SkipTest("showhdr not on PATH (NMRPipe not installed)")
+
+    def test_routes_agree_on_every_spectrum(self):
+        """showhdr and nmrglue fallback must return the identical tuple."""
+        for path in self.SPECTRA:
+            if not os.path.isfile(path):
+                continue
+            with self.subTest(spectrum=os.path.basename(path)):
+                primary = headers.read_headers(path)
+                fallback = self._forced_fallback(path)
+
+                self.assertEqual(primary[0], fallback[0], "ND differs")
+                self.assertEqual(primary[5], fallback[5], "axis names differ")
+                # Sizes are integers, so they must match exactly.
+                self.assertEqual(primary[1], fallback[1], "sz differs")
+                # showhdr prints SW/PPM to 3 decimals; nmrglue keeps full
+                # float precision, so allow the print round-off (<=1e-3).
+                for idx, label in ((2, "sw"), (3, "pfst"), (4, "plst")):
+                    for dim in primary[idx]:
+                        self.assertAlmostEqual(
+                            primary[idx][dim], fallback[idx][dim], delta=1e-3,
+                            msg=f"{label}[{dim}] differs between routes")
+
+    def test_showhdr_keeps_nmrpipe_dim_keying(self):
+        """Dim 1 must stay the indirect (15N) axis, dim 2 the direct (1H).
+
+        Guards the transposition: showhdr's first printed column is the X/1H
+        axis, which is NMRPipe dim **2**, not dim 1.
+        """
+        azurin_path = _ensure_file(AZURIN_FT2)
+        ND, sz, sw, pfst, plst, nam = headers.read_headers(azurin_path)
+
+        self.assertEqual(ND, 2)
+        self.assertEqual(nam, {1: "N", 2: "HN"})
+        self.assertEqual(sz[1], 256)     # 15N indirect
+        self.assertEqual(sz[2], 1279)    # 1H direct
+        self.assertAlmostEqual(pfst[1], 138.012, places=2)
+        self.assertAlmostEqual(pfst[2], 10.998, places=2)
+
+    def test_e2e_p5_to_tab_with_showhdr(self):
+        """End-to-end P5→peaks→tab must yield in-range indices via showhdr."""
+        peaksto_peaks = load("P5toPeaks")
+        peaksto_tab = load("PeakstoTab")
+
+        azurin_path = _ensure_file(AZURIN_FT2)
+        azurin_p5 = _ensure_file(AZURIN_P5)
+        ND, sz, sw, pfst, plst, nam = headers.read_headers(azurin_path)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            peaks_file = os.path.join(tmpdir, "Azurin.peaks")
+            peaksto_peaks.main(azurin_p5, spec_path=azurin_path, out=peaks_file)
+            tab_file = os.path.join(tmpdir, "Azurin.tab")
+            peaksto_tab.main(peaks_file, spec_path=azurin_path, out=tab_file)
+
+            with open(tab_file) as f:
+                lines = f.readlines()
+            with open(peaks_file) as f:
+                pk = f.readlines()
+
+            iname = [l.split() for l in pk if l.startswith("#INAME")]
+            self.assertEqual(iname[0][2], "HN")
+            self.assertEqual(iname[1][2], "N")
+
+            data = [l.split() for l in lines if l.startswith("DATA")]
+            self.assertEqual(data[0][2], "HN")
+            self.assertEqual(data[1][2], "N")
+
+            vars_line = next((l for l in lines if l.startswith("VARS   ")), None)
+            self.assertIsNotNone(vars_line, "No VARS line found in tab")
+            v_list = vars_line.strip().replace("VARS   ", "").split()
+            idx_X1, idx_Y1 = v_list.index("X1"), v_list.index("Y1")
+            idx_X3, idx_Y3 = v_list.index("X3"), v_list.index("Y3")
+
+            rows = [l.split() for l in lines
+                    if l.strip() and l.strip()[0].isdigit() and len(l.split()) == len(v_list)]
+            self.assertGreater(len(rows), 0, "No data rows parsed from tab")
+
+            for parts in rows:
+                x1, x3 = int(parts[idx_X1]), int(parts[idx_X3])
+                y1, y3 = int(parts[idx_Y1]), int(parts[idx_Y3])
+                self.assertGreaterEqual(x1, 1, f"X1={x1} below 1")
+                self.assertLessEqual(x3, int(sz[2]), f"X3={x3} exceeds sz[2]={sz[2]}")
+                self.assertGreaterEqual(y1, 1, f"Y1={y1} below 1")
+                self.assertLessEqual(y3, int(sz[1]), f"Y3={y3} exceeds sz[1]={sz[1]}")
+
+
 if __name__ == "__main__":
     unittest.main()

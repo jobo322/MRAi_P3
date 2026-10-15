@@ -46,23 +46,43 @@ def read_headers(spec_path):
 
     # Parse showhdr -verb output
     ND = None
+    raw_order = None
     nam = {}
     for line in text.splitlines():
         line = line.rstrip()
         if line.startswith("FILE:"):
             parts = line.split()
             ND = int(parts[parts.index("DIM:") + 1])
+        if line.startswith("ORDER:"):
+            # `ORDER: 2 1 PIPE: 0 CUBE: 0 ...` names the NMRPipe dimension
+            # shown in each printed axis column. showhdr emits columns in
+            # *display* order (X, Y[, Z] == FDF2, FDF1[, ...]), which is the
+            # reverse of NMRPipe's own 1..ND numbering for the usual
+            # non-transposed case, so the column index cannot be the key.
+            nums = []
+            for tok in line.split()[1:]:
+                if tok == "PIPE:":
+                    break
+                nums.append(int(float(tok)))
+            if len(nums) == ND:
+                raw_order = nums
         if line.startswith("NAME:"):
             parts = line.split()
             for i in range(ND):
                 lbl = str(parts[i - ND])
-                nam[i + 1] = "HN" if "H" in lbl else (lbl[-1] if lbl else str(i + 1))
+                dim = _showhdr_order(raw_order, ND)[i]
+                nam[dim] = "HN" if "H" in lbl else (lbl[-1] if lbl else str(dim))
 
     if ND is None:
         raise ValueError(f"Could not parse header from {spec_path}")
 
+    # Resolve once here so the value-block loop below reuses the same mapping.
+    order = _showhdr_order(raw_order, ND)
+
     # showhdr reports absolute Hz values for PPMSIZE/PMTOTAL etc.,
     # but also provides SW_PPM and PPM_FIRST/PPM_LAST directly.
+    # Each value line holds its axes in the same display order as ORDER,
+    # so column i belongs to NMRPipe dimension `order[i]`.
     sz = {}
     sw = {}
     pfst = {}
@@ -72,21 +92,37 @@ def read_headers(spec_path):
         if line.startswith("PPM FIRST:"):
             parts = line.split()
             for i in range(ND):
-                pfst[i + 1] = float(parts[i - ND])
+                pfst[order[i]] = float(parts[i - ND])
         if line.startswith("PPM LAST:"):
             parts = line.split()
             for i in range(ND):
-                plst[i + 1] = float(parts[i - ND])
+                plst[order[i]] = float(parts[i - ND])
         if line.startswith("SW PPM:"):
             parts = line.split()
             for i in range(ND):
-                sw[i + 1] = float(parts[i - ND])
+                sw[order[i]] = float(parts[i - ND])
         if line.startswith("DATA SIZE:"):
             parts = line.split()
             for i in range(ND):
-                sz[i + 1] = float(parts[i - ND])
+                sz[order[i]] = float(parts[i - ND])
 
     return ND, sz, sw, pfst, plst, nam
+
+
+def _showhdr_order(raw_order, ND):
+    """Map showhdr's printed axis columns to NMRPipe dimension numbers.
+
+    showhdr emits one column per axis in *display* order (X, Y[, Z]). The
+    `ORDER:` line carries exactly that mapping as NMRPipe dimension numbers,
+    so column ``i`` holds the values of dimension ``raw_order[i]``.
+
+    Returns ``raw_order`` when it parsed cleanly; otherwise falls back to the
+    display order of the usual non-transposed file, which is the reverse of
+    NMRPipe's 1..ND numbering.
+    """
+    if raw_order is not None and len(raw_order) == ND:
+        return list(raw_order)
+    return list(range(ND, 0, -1))
 
 
 def _read_headers_fallback(spec_path):
