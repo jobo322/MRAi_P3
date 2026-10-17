@@ -2,6 +2,7 @@ import os, gc
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 import tensorflow as tf
 import numpy as np
+from .model_output import single_output
 #####################################################################
 def SKY(US,axis):
     MAX = np.max(US,axis=axis); MIN = np.min(US,axis=axis)
@@ -56,7 +57,7 @@ def Production_2D(tests_data,Dirc_2D,axis=0,Spe_The=0):
 
     pred = np.zeros((tests_data.size,1))
     tests,_ = split_2D(tests_data,Size)
-    pred[RI.flatten()] = model.predict(tests[RI.flatten()], batch_size=2**16)['dense_14']
+    pred[RI.flatten()] = single_output(model.predict(tests[RI.flatten()], batch_size=2**16))
     pred = pred.reshape(tests_data.shape)
 
     del tests,model,RI
@@ -100,7 +101,7 @@ def Production_3D(tests_data,Filter,Dirc_3D,Filter_The):
 
     pred = np.zeros((tests_data.size,1))
     tests = split_3D_RI(tests_data,RI,Size)
-    pred[RI.flatten()] = model.predict(tests, batch_size=2**16)['dense_9']
+    pred[RI.flatten()] = single_output(model.predict(tests, batch_size=2**16))
     pred = pred.reshape(tests_data.shape)
 
     del tests,model,RI

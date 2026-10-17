@@ -110,7 +110,8 @@ def main():
         blk = blk / n
         m = flat[r0*W:r1*W]
         if m.any():
-            out = model.predict(blk[m], batch_size=2**16, verbose=0)['dense_14']
+            out = P3.model_output.single_output(
+                model.predict(blk[m], batch_size=2**16, verbose=0))
             pred[r0*W:r1*W][m] = out
             del out
         del col, row, blk, n, m
