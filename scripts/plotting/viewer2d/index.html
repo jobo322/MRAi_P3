@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>folder-51 2D JRES viewer — spectrum + P3 + peaks</title>
+<style>
+  :root { --bg:#f6f7f9; --panel:#fff; --border:#d9dee5; --text:#1f2733; --muted:#6b7686; --accent:#2563eb; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font:13px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; color:var(--text); background:var(--bg); }
+  #app { display:flex; height:100vh; }
+  /* ── sidebar ── */
+  #side { width:290px; min-width:290px; border-right:1px solid var(--border); background:var(--panel); display:flex; flex-direction:column; }
+  #side header { padding:10px 12px 8px; border-bottom:1px solid var(--border); }
+  #side header h1 { font-size:14px; margin:0 0 2px; }
+  #meta { color:var(--muted); font-size:11.5px; }
+  #filter { margin:8px 12px 4px; width:calc(100% - 24px); padding:5px 8px; border:1px solid var(--border); border-radius:6px; }
+  #list { overflow-y:auto; flex:1; padding:4px 0; }
+  .item { display:flex; gap:8px; align-items:center; padding:6px 12px; cursor:pointer; border-left:3px solid transparent; }
+  .item:hover { background:#eef2f7; }
+  .item.active { background:#e7eefc; border-left-color:var(--accent); }
+  .item .sw { display:inline-block; width:10px; height:10px; border-radius:2px; }
+  .item .r { color:var(--muted); font-size:11.5px; margin-left:auto; }
+  /* ── main ── */
+  #main { flex:1; display:flex; flex-direction:column; min-width:0; }
+  #toolbar { display:flex; flex-wrap:wrap; gap:14px; align-items:center; padding:8px 14px; background:var(--panel); border-bottom:1px solid var(--border); }
+  #toolbar label { display:flex; gap:6px; align-items:center; color:var(--muted); font-size:12px; }
+  #toolbar input[type=range] { width:110px; }
+  #toolbar .val { font-variant-numeric:tabular-nums; color:var(--text); min-width:52px; }
+  #toolbar select { padding:2px 4px; }
+  #toolbar button { padding:4px 10px; border:1px solid var(--border); background:#fff; border-radius:6px; cursor:pointer; }
+  #toolbar button:hover { background:#eef2f7; }
+  #plotWrap { flex:1; position:relative; min-height:0; background:#fff; }
+  #cv, #ov { position:absolute; inset:0; width:100%; height:100%; }
+  #cv { cursor:crosshair; }
+  #ov { pointer-events:none; }
+  #rangeInfo { position:absolute; left:10px; top:8px; font-size:11.5px; color:var(--muted); background:rgba(255,255,255,.78); padding:2px 8px; border-radius:6px; pointer-events:none; font-variant-numeric:tabular-nums; }
+  #busy { position:absolute; right:10px; top:8px; display:none; font-size:11.5px; color:var(--accent); background:rgba(255,255,255,.78); padding:2px 8px; border-radius:6px; }
+  /* ── info panel ── */
+  #info { border-top:1px solid var(--border); background:var(--panel); padding:8px 14px; max-height:230px; overflow-y:auto; }
+  #info h2 { font-size:13px; margin:0 0 4px; }
+  #specInfo { color:var(--muted); font-size:12px; font-variant-numeric:tabular-nums; }
+  #peaksToggle { cursor:pointer; color:var(--accent); user-select:none; font-size:12px; }
+  #peaksTable { display:none; margin-top:6px; border-collapse:collapse; font-size:11.5px; }
+  #peaksTable.show { display:table; }
+  #peaksTable th, #peaksTable td { border:1px solid var(--border); padding:2px 7px; text-align:right; font-variant-numeric:tabular-nums; }
+  #peaksTable th { background:#eef2f7; position:sticky; top:0; }
+  .hint { color:var(--muted); font-size:11px; margin-top:6px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="side">
+    <header>
+      <h1>folder-51 2D JRES viewer</h1>
+      <div id="meta">cargando…</div>
+    </header>
+    <input id="filter" placeholder="filtrar: spectrum / P3 …">
+    <div id="list"></div>
+  </aside>
+  <main id="main">
+    <div id="toolbar">
+      <label>niveles <input id="nLevels" type="range" min="4" max="32" value="14"><span class="val" id="nLevelsVal">14</span></label>
+      <label>nivel mín ×SD <input id="lowMult" type="range" min="1" max="50" step="0.5" value="6"><span class="val" id="lowMultVal">6.0×</span></label>
+      <label>nivel máx %zMax <input id="highFrac" type="range" min="5" max="100" value="90"><span class="val" id="highFracVal">90%</span></label>
+      <label>espaciado
+        <select id="spacing"><option value="log">log</option><option value="linear">lineal</option></select>
+      </label>
+      <label><input id="lockLevels" type="checkbox"> fijar niveles</label>
+      <label><input id="showPeaks" type="checkbox" checked> picos</label>
+      <label><input id="underlay" type="checkbox" checked> raster</label>
+      <button id="resetZoom">reset zoom</button>
+    </div>
+    <div id="plotWrap">
+      <canvas id="cv"></canvas>
+      <canvas id="ov"></canvas>
+      <div id="rangeInfo"></div>
+      <div id="busy">cargando…</div>
+    </div>
+    <div id="info">
+      <h2 id="specTitle">—</h2>
+      <div id="specInfo"></div>
+      <span id="peaksToggle">▸ mostrar picos</span>
+      <table id="peaksTable"></table>
+      <div class="hint">click + drag: zoom a la región · doble click o «reset zoom»: espectro completo · rueda: zoom sobre el cursor · ejes: x = F2 (ppm, alto a la izquierda), y = F1 (Hz)</div>
+    </div>
+  </main>
+</div>
+<script>
+'use strict';
+// ─────────────────────────── state ───────────────────────────
+// Same control system as cheminfo/spectrum-generator viewer/index.html, but
+// consuming the folder-51 artifacts produced once by convert_2d.py (the exact
+// loaders of interactive_2d.py): spectrum.bin / p3.bin / f2ppm.bin / f1hz.bin.
+const $ = (id) => document.getElementById(id);
+let META = null;               // /api/meta
+const ITEMS = [];              // selectable maps: spectrum, p3
+const byKey = new Map();       // key → item
+const GRID = { nx: 0, ny: 0 }; // x = columns = F2 (ppm) · y = rows = F1 (Hz)
+let ppm = null, f1hz = null;   // Float32Array axis scales
+let selectedKey = null;
+let view = null;               // {x0, x1, y0, y1} grid indices (y up)
+let lastLevels = null;         // levels cache when "fijar niveles" is on
+let vp = null;                 // last render transform (pixel ↔ grid)
+const zCache = new Map();      // key → Float32Array (z[row*nx + col])
+const sdCache = new Map();     // key → robust noise SD (sampled MAD)
+const peaks = { x: [], y: [], rows: [] };
+const SAMPLE_CACHE_LIMIT = 3;
+const sampleCache = new Map(); // crop key → {vals, nr, nc, sx, sy, subMin, subMax}
+
+// ─────────────────────────── data loading ───────────────────────────
+async function fetchJSON(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url} → ${r.status}`);
+  return r.json();
+}
+async function fetchArray(key) {
+  if (zCache.has(key)) return zCache.get(key);
+  const r = await fetch(`/api/bin/${key}`);
+  if (!r.ok) throw new Error(`${key} → ${r.status}`);
+  const arr = new Float32Array(await r.arrayBuffer());
+  zCache.set(key, arr);
+  return arr;
+}
+// Robust noise SD from a sampled MAD (2M points is overkill for a median).
+function robustSD(z) {
+  const step = Math.max(1, Math.floor(z.length / 65536));
+  const s = new Float64Array(Math.ceil(z.length / step));
+  for (let i = 0, k = 0; i < z.length; i += step, k++) s[k] = z[i];
+  const med = median(s);
+  for (let i = 0; i < s.length; i++) s[i] = Math.abs(s[i] - med);
+  return Math.max(median(s) * 1.4826, 1e-30);
+}
+function median(a) {
+  const arr = Array.from(a).sort((x, y) => x - y);
+  const m = arr.length >> 1;
+  return arr.length & 1 ? arr[m] : (arr[m - 1] + arr[m]) / 2;
+}
+function fullView() { return { x0: 0, x1: GRID.nx, y0: 0, y1: GRID.ny }; }
+
+// axis helpers (uniform grids; ppm/f1hz may descend — works either way)
+function ppmAt(t) { return ppm[0] + (ppm[GRID.nx - 1] - ppm[0]) * t / (GRID.nx - 1); }
+function f1At(t)  { return f1hz[0] + (f1hz[GRID.ny - 1] - f1hz[0]) * t / (GRID.ny - 1); }
+function colOf(ppmVal) { return (ppmVal - ppm[0]) / (ppm[GRID.nx - 1] - ppm[0]) * (GRID.nx - 1); }
+function rowOf(hzVal)  { return (hzVal - f1hz[0]) / (f1hz[GRID.ny - 1] - f1hz[0]) * (GRID.ny - 1); }
+
+// ─────────────────────────── sidebar ───────────────────────────
+function buildSidebar() {
+  const list = $('list');
+  list.innerHTML = '';
+  const f = $('filter').value.trim().toLowerCase();
+  for (const it of ITEMS) {
+    const text = it.label;
+    if (f && !text.toLowerCase().includes(f)) continue;
+    const div = document.createElement('div');
+    div.className = 'item' + (it.key === selectedKey ? ' active' : '');
+    div.innerHTML =
+      `<span class="sw" style="background:${it.color}"></span>` +
+      `<span>${it.label}</span>` +
+      `<span class="r">${zCache.has(it.key) ? 'cargado' : ''}</span>`;
+    div.onclick = () => { if (it.key !== selectedKey) select(it.key); };
+    list.appendChild(div);
+  }
+}
+
+// ─────────────────────────── selection + info panel ───────────────────────────
+async function select(key) {
+  selectedKey = key;
+  view = fullView();
+  if (!$('lockLevels').checked) lastLevels = null;
+  sampleCache.clear();
+  buildSidebar();
+  updateInfoPanel();
+  $('busy').style.display = 'block';
+  try {
+    const z = await fetchArray(key);
+    if (!sdCache.has(key)) sdCache.set(key, robustSD(z));
+  } catch (err) {
+    $('specTitle').textContent = `mapa ${key}`;
+    $('specInfo').textContent = `error: ${err.message}`;
+  } finally {
+    $('busy').style.display = 'none';
+  }
+  requestRender();
+}
+function updateInfoPanel() {
+  const z = zCache.get(selectedKey);
+  const it = byKey.get(selectedKey);
+  if (!z || !it) return;
+  const sd = sdCache.get(selectedKey);
+  let zMax = 0, zMin = Infinity;
+  for (let i = 0; i < z.length; i += 16) {
+    const v = z[i];
+    if (v > zMax) zMax = v;
+    if (v < zMin) zMin = v;
+  }
+  $('specTitle').textContent = `${it.label} · ${peaks.x.length} picos del sistema`;
+  $('specInfo').textContent =
+    `${GRID.ny}×${GRID.nx} · obs ${META.obs.toFixed(3)} MHz · ` +
+    `SD=${sd.toExponential(2)} · SNR≈${(zMax / sd).toFixed(0)} · zMax=${zMax.toExponential(2)}`;
+  buildPeaksTable();
+}
+function buildPeaksTable() {
+  const t = $('peaksTable');
+  t.innerHTML =
+    '<tr><th>#</th><th>X_PPM</th><th>Y_HZ</th><th>HEIGHT</th><th>VOL</th><th>TYPE</th></tr>';
+  if (peaks.rows.length) {
+    for (const [k, p] of peaks.rows.entries()) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${p.index}</td><td>${p.xPpm.toFixed(3)}</td><td>${p.yHz.toFixed(2)}</td>` +
+        `<td>${p.height.toExponential(2)}</td><td>${p.vol.toExponential(2)}</td><td>${p.type}</td>`;
+      t.appendChild(tr);
+    }
+  } else {
+    for (const [k, x] of peaks.x.entries()) {
+      const tr = document.createElement('tr');
+      tr.innerHTML =
+        `<td>${k + 1}</td><td>${x.toFixed(3)}</td><td>${peaks.y[k].toFixed(2)}</td>` +
+        `<td>—</td><td>—</td><td>—</td>`;
+      t.appendChild(tr);
+    }
+  }
+}
+
+// ─────────────────────────── contour levels ───────────────────────────
+function computeLevels(sd, zMaxVis) {
+  const n = Number($('nLevels').value);
+  const lowMult = Number($('lowMult').value);
+  const highFrac = Number($('highFrac').value) / 100;
+  const mode = $('spacing').value;
+  const low = Math.max(sd * lowMult, zMaxVis * 1e-4);
+  const high = Math.max(low * 1.001, zMaxVis * highFrac);
+  const levels = [];
+  for (let k = 0; k < n; k++) {
+    const t = n === 1 ? 0 : k / (n - 1);
+    levels.push(mode === 'log' ? low * (high / low) ** t : low + (high - low) * t);
+  }
+  return levels;
+}
+function currentLevels(sd, zMaxVis) {
+  if ($('lockLevels').checked && lastLevels) return lastLevels;
+  lastLevels = computeLevels(sd, zMaxVis);
+  return lastLevels;
+}
+
+// ─────────────────────────── marching squares ───────────────────────────
+// Adaptive sampling: at full view the grid is 64×32768; marching squares over
+// every cell × every level is wasted at that resolution, so the crop is
+// sampled to ≤420 cells per axis (cache keyed by crop). Output: flat segments
+// [x, y, x, y, …] in sampled-grid units (x = col direction, y = row direction).
+const MAX_GRID = 420;
+function sampledGrid(z, cx0, cx1, cy0, cy1) {
+  const key = `${selectedKey}|${cx0},${cx1},${cy0},${cy1}`;
+  let entry = sampleCache.get(key);
+  if (entry) return entry;
+  const nCols = cx1 - cx0, nRows = cy1 - cy0;
+  const sx = Math.max(1, Math.ceil(nCols / MAX_GRID));
+  const sy = Math.max(1, Math.ceil(nRows / MAX_GRID));
+  const nc = Math.ceil(nCols / sx), nr = Math.ceil(nRows / sy);
+  const vals = new Float32Array(nr * nc);
+  let subMin = Infinity, subMax = -Infinity;
+  for (let i = 0; i < nr; i++) {
+    const r = Math.min(cy0 + i * sy, GRID.ny - 1);
+    for (let j = 0; j < nc; j++) {
+      const c = Math.min(cx0 + j * sx, GRID.nx - 1);
+      const v = z[r * GRID.nx + c];
+      vals[i * nc + j] = v;
+      if (v < subMin) subMin = v;
+      if (v > subMax) subMax = v;
+    }
+  }
+  entry = { vals, nr, nc, sx, sy, subMin, subMax };
+  sampleCache.set(key, entry);
+  if (sampleCache.size > SAMPLE_CACHE_LIMIT) {
+    sampleCache.delete(sampleCache.keys().next().value);
+  }
+  return entry;
+}
+function marchingSquares(sg, level) {
+  const { vals, nr, nc, subMin, subMax } = sg;
+  if (subMax < level || subMin > level) return null;   // level out of range
+  const segs = [];
+  for (let i = 0; i < nr - 1; i++) {
+    const off = i * nc;
+    for (let j = 0; j < nc - 1; j++) {
+      const tl = vals[off + j], tr = vals[off + j + 1];
+      const br = vals[off + nc + j + 1], bl = vals[off + nc + j];
+      let code = 0;
+      if (tl > level) code |= 1;
+      if (tr > level) code |= 2;
+      if (br > level) code |= 4;
+      if (bl > level) code |= 8;
+      if (code === 0 || code === 15) continue;
+      const top = () => [j + (level - tl) / (tr - tl), i];
+      const right = () => [j + 1, i + (level - tr) / (br - tr)];
+      const bottom = () => [j + (level - bl) / (br - bl), i + 1];
+      const left = () => [j, i + (level - tl) / (bl - tl)];
+      switch (code) {
+        case 1: case 14: { const a = top(), b = left(); segs.push(a[0], a[1], b[0], b[1]); break; }
+        case 2: case 13: { const a = top(), b = right(); segs.push(a[0], a[1], b[0], b[1]); break; }
+        case 3: case 12: { const a = right(), b = left(); segs.push(a[0], a[1], b[0], b[1]); break; }
+        case 4: case 11: { const a = right(), b = bottom(); segs.push(a[0], a[1], b[0], b[1]); break; }
+        case 6: case 9:  { const a = top(), b = bottom(); segs.push(a[0], a[1], b[0], b[1]); break; }
+        case 7: case 8:  { const a = left(), b = bottom(); segs.push(a[0], a[1], b[0], b[1]); break; }
+        case 5: {
+          const a = top(), b = left(), c = right(), d = bottom();
+          segs.push(a[0], a[1], b[0], b[1], c[0], c[1], d[0], d[1]);
+          break;
+        }
+        case 10: {
+          const a = top(), b = right(), c = left(), d = bottom();
+          segs.push(a[0], a[1], b[0], b[1], c[0], c[1], d[0], d[1]);
+          break;
+        }
+      }
+    }
+  }
+  return segs;
+}
+
+// ─────────────────────────── rendering ───────────────────────────
+let raf = 0;
+function requestRender() {
+  if (raf) return;
+  raf = requestAnimationFrame(() => { raf = 0; render(); });
+}
+function render() {
+  const wrap = $('plotWrap');
+  const cv = $('cv');
+  const dpr = window.devicePixelRatio || 1;
+  const W = Math.max(50, wrap.clientWidth);
+  const H = Math.max(50, wrap.clientHeight);
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    for (const c of [cv, $('ov')]) {
+      c.width = Math.round(W * dpr);
+      c.height = Math.round(H * dpr);
+    }
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+  clearOverlay();
+  vp = null;
+  const z = zCache.get(selectedKey);
+  if (!z) return;
+  const m = { l: 54, r: 12, t: 12, b: 32 };
+  const pw = W - m.l - m.r, ph = H - m.t - m.b;
+  const { x0, x1, y0, y1 } = view;
+  // escala independiente por eje: F2 tiene 32768 puntos y F1 solo 64; un
+  // aspecto 1:1 los aplastaría a una línea. Cada eje llena la ventana
+  // disponible (igual que el auto-escalado de matplotlib en interactive_2d.py).
+  const scaleX = pw / (x1 - x0);
+  const scaleY = ph / (y1 - y0);
+  const ox = m.l;
+  const oy = m.t;
+  const px = (gx) => ox + (gx - x0) * scaleX;
+  const py = (gy) => oy + (y1 - gy) * scaleY; // y grows upward
+  vp = { ox, oy, scaleX, scaleY, x0, y1 };
+  // visible crop (integer, clamped)
+  const cx0 = Math.max(0, Math.floor(x0)), cx1 = Math.min(GRID.nx, Math.ceil(x1));
+  const cy0 = Math.max(0, Math.floor(y0)), cy1 = Math.min(GRID.ny, Math.ceil(y1));
+  let zMaxVis = 0;
+  for (let r = cy0; r < cy1; r++) {
+    const off = r * GRID.nx;
+    for (let c = cx0; c < cx1; c++) { const v = z[off + c]; if (v > zMaxVis) zMaxVis = v; }
+  }
+  const sd = sdCache.get(selectedKey) || 1e-30;
+  const levels = currentLevels(sd, zMaxVis);
+  // plot frame
+  ctx.strokeStyle = '#9aa4b1';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(px(x0), py(y1), (x1 - x0) * scaleX, (y1 - y0) * scaleY);
+  // grayscale underlay normalized between the current contour levels
+  // (min level → white, max level → black) so it responds to the same sliders
+  if ($('underlay').checked && zMaxVis > 0) {
+    const stepX = Math.max(1, Math.ceil((cx1 - cx0) / 640));
+    const stepY = Math.max(1, Math.ceil((cy1 - cy0) / 320));
+    const w = Math.ceil((cx1 - cx0) / stepX), h = Math.ceil((cy1 - cy0) / stepY);
+    const offC = document.createElement('canvas');
+    offC.width = w; offC.height = h;
+    const octx = offC.getContext('2d');
+    const img = octx.createImageData(w, h);
+    const lo = Math.min(...levels), hi = Math.max(...levels);
+    const span = Math.max(hi - lo, lo * 1e-9);
+    for (let j = 0; j < h; j++) {
+      const r = Math.max(cy0, cy1 - 1 - j * stepY);
+      for (let i = 0; i < w; i++) {
+        const c = cx0 + i * stepX;
+        const v = r < GRID.ny && c < GRID.nx ? z[r * GRID.nx + c] : 0;
+        const t = Math.min(1, Math.max(0, (v - lo) / span));
+        const g = Math.min(255, Math.round(t * 255));
+        const k = (j * w + i) * 4;
+        img.data[k] = 255 - g; img.data[k + 1] = 255 - g; img.data[k + 2] = 255 - g;
+        img.data[k + 3] = 235;
+      }
+    }
+    octx.putImageData(img, 0, 0);
+    ctx.imageSmoothingEnabled = true;
+    ctx.drawImage(offC, px(cx0), py(cy1), (cx1 - cx0) * scaleX, (cy1 - cy0) * scaleY);
+  }
+  // contour lines (color: blue → red by level)
+  const sg = sampledGrid(z, cx0, cx1, cy0, cy1);
+  const toX = (gx) => px(cx0 + gx * sg.sx);
+  const toY = (gy) => py(cy0 + gy * sg.sy);
+  levels.forEach((level, k) => {
+    const segs = marchingSquares(sg, level);
+    if (!segs) return;
+    const t = levels.length === 1 ? 1 : k / (levels.length - 1);
+    ctx.strokeStyle = `hsl(${Math.round(225 * (1 - t))}, 80%, 38%)`;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let s = 0; s < segs.length; s += 4) {
+      ctx.moveTo(toX(segs[s]), toY(segs[s + 1]));
+      ctx.lineTo(toX(segs[s + 2]), toY(segs[s + 3]));
+    }
+    ctx.stroke();
+  });
+  // system peaks (red crosses), like the labels overlay of the original
+  if ($('showPeaks').checked) {
+    ctx.strokeStyle = 'rgba(220,38,38,.85)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    for (let p = 0; p < peaks.x.length; p++) {
+      const c = colOf(peaks.x[p]), r = rowOf(peaks.y[p]);
+      if (c < cx0 - 1 || c > cx1 || r < cy0 - 1 || r > cy1) continue;
+      const X = px(c), Y = py(r);
+      const d = Math.max(3, Math.min(6, scaleY * 0.8));
+      ctx.moveTo(X - d, Y - d); ctx.lineTo(X + d, Y + d);
+      ctx.moveTo(X - d, Y + d); ctx.lineTo(X + d, Y - d);
+    }
+    ctx.stroke();
+  }
+  drawAxes(ctx, px, py, W, H, m);
+  updateRangeInfo();
+}
+
+// ─────────────────────────── axes & overlays ───────────────────────────
+function niceStep(range, targetTicks) {
+  const raw = range / Math.max(1, targetTicks);
+  const mag = 10 ** Math.floor(Math.log10(raw));
+  for (const mm of [1, 2, 5, 10]) if (raw <= mm * mag) return mm * mag;
+  return 10 * mag;
+}
+function drawAxes(ctx, px, py, W, H, m) {
+  ctx.fillStyle = '#6b7686';
+  ctx.strokeStyle = '#e2e6ec';
+  ctx.lineWidth = 1;
+  ctx.font = '10.5px system-ui, sans-serif';
+  const { x0, x1, y0, y1 } = view;
+  // x ticks (bottom) — labels in F2 ppm
+  const sx = niceStep(x1 - x0, 10);
+  ctx.textAlign = 'center';
+  for (let t = Math.ceil(x0 / sx) * sx; t <= x1; t += sx) {
+    const X = px(t);
+    ctx.beginPath(); ctx.moveTo(X, py(y1)); ctx.lineTo(X, H - m.b + 4); ctx.stroke();
+    ctx.fillText(ppmAt(t).toFixed(2), X, H - m.b + 16);
+  }
+  // y ticks (left) — labels in F1 Hz
+  const sy = niceStep(y1 - y0, 8);
+  ctx.textAlign = 'right';
+  for (let t = Math.ceil(y0 / sy) * sy; t <= y1; t += sy) {
+    const Y = py(t);
+    ctx.beginPath(); ctx.moveTo(px(x0) - 4, Y); ctx.lineTo(m.l - 6, Y); ctx.stroke();
+    ctx.fillText(f1At(t).toFixed(1), m.l - 8, Y + 3.5);
+  }
+  ctx.textAlign = 'center';
+  ctx.fillText('F2 (ppm)', m.l + (W - m.l - m.r) / 2, H - 6);
+  ctx.save();
+  ctx.translate(12, m.t + (H - m.t - m.b) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('F1 (Hz)', 0, 0);
+  ctx.restore();
+}
+function updateRangeInfo() {
+  const { x0, x1, y0, y1 } = view;
+  const full = x1 - x0 >= GRID.nx - 1e-9 && y1 - y0 >= GRID.ny - 1e-9;
+  $('rangeInfo').textContent =
+    `F2: ${ppmAt(x0).toFixed(2)}–${ppmAt(x1).toFixed(2)} ppm · F1: ${f1At(y0).toFixed(1)}–${f1At(y1).toFixed(1)} Hz` +
+    (full ? ' (completo)' : ' (zoom)');
+}
+let drag = null;
+function clearOverlay() {
+  const ov = $('ov');
+  const ctx = ov.getContext('2d');
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, ov.width, ov.height);
+}
+function drawSelection() {
+  clearOverlay();
+  if (!drag) return;
+  const dpr = window.devicePixelRatio || 1;
+  const ctx = $('ov').getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const x = Math.min(drag.ax, drag.bx), y = Math.min(drag.ay, drag.by);
+  const w = Math.abs(drag.bx - drag.ax), h = Math.abs(drag.by - drag.ay);
+  ctx.strokeStyle = '#dc2626';
+  ctx.setLineDash([5, 4]);
+  ctx.lineWidth = 1.2;
+  ctx.strokeRect(x, y, w, h);
+}
+function canvasPoint(ev) {
+  const rect = $('cv').getBoundingClientRect();
+  return { x: ev.clientX - rect.left, y: ev.clientY - rect.top };
+}
+function zoomToPixels(ax, ay, bx, by) {
+  if (!vp) return;
+  const gxA = vp.x0 + (ax - vp.ox) / vp.scaleX;
+  const gxB = vp.x0 + (bx - vp.ox) / vp.scaleX;
+  const gyA = vp.y1 - (ay - vp.oy) / vp.scaleY;
+  const gyB = vp.y1 - (by - vp.oy) / vp.scaleY;
+  let x0 = Math.min(gxA, gxB), x1 = Math.max(gxA, gxB);
+  let y0 = Math.min(gyA, gyB), y1 = Math.max(gyA, gyB);
+  const MIN = 4; // avoid degenerate zooms
+  if (x1 - x0 < MIN) { const c = (x0 + x1) / 2; x0 = c - MIN / 2; x1 = c + MIN / 2; }
+  if (y1 - y0 < MIN) { const c = (y0 + y1) / 2; y0 = c - MIN / 2; y1 = c + MIN / 2; }
+  view = { x0, x1, y0, y1 };
+  requestRender();
+}
+function zoomAbout(cx, cy, factor) {
+  const cxg = vp.x0 + (cx - vp.ox) / vp.scaleX;
+  const cyg = vp.y1 - (cy - vp.oy) / vp.scaleY;
+  view = {
+    x0: cxg - (cxg - view.x0) * factor, x1: cxg + (view.x1 - cxg) * factor,
+    y0: cyg - (cyg - view.y0) * factor, y1: cyg + (view.y1 - cyg) * factor,
+  };
+  requestRender();
+}
+
+// ─────────────────────────── events + init ───────────────────────────
+function bindEvents() {
+  $('filter').addEventListener('input', buildSidebar);
+  const levelInputs = ['nLevels', 'lowMult', 'highFrac', 'spacing'];
+  for (const id of levelInputs) {
+    $(id).addEventListener('input', () => {
+      $('nLevelsVal').textContent = $('nLevels').value;
+      $('lowMultVal').textContent = Number($('lowMult').value).toFixed(1) + '×';
+      $('highFracVal').textContent = $('highFrac').value + '%';
+      if (!$('lockLevels').checked) lastLevels = null;
+      requestRender();
+    });
+  }
+  $('lockLevels').addEventListener('change', requestRender);
+  $('underlay').addEventListener('change', requestRender);
+  $('showPeaks').addEventListener('change', requestRender);
+  $('resetZoom').addEventListener('click', () => { view = fullView(); requestRender(); });
+  $('peaksToggle').addEventListener('click', () => {
+    peaksShown = !peaksShown;
+    $('peaksToggle').textContent = peaksShown ? '▾ ocultar picos' : '▸ mostrar picos';
+    $('peaksTable').classList.toggle('show', peaksShown);
+  });
+  const cv = $('cv');
+  cv.addEventListener('mousedown', (ev) => {
+    if (ev.button !== 0) return;
+    const p = canvasPoint(ev);
+    drag = { ax: p.x, ay: p.y, bx: p.x, by: p.y };
+    ev.preventDefault();
+  });
+  cv.addEventListener('mousemove', (ev) => {
+    if (!drag) return;
+    const p = canvasPoint(ev);
+    drag.bx = p.x; drag.by = p.y;
+    drawSelection();
+  });
+  window.addEventListener('mouseup', (ev) => {
+    if (!drag) return;
+    const p = canvasPoint(ev);
+    drag.bx = p.x; drag.by = p.y;
+    const dx = Math.abs(drag.bx - drag.ax), dy = Math.abs(drag.by - drag.ay);
+    const d = drag; drag = null;
+    clearOverlay();
+    if (dx < 4 && dy < 4) return; // simple click — no zoom
+    zoomToPixels(Math.min(d.ax, d.bx), Math.min(d.ay, d.by), Math.max(d.ax, d.bx), Math.max(d.ay, d.by));
+  });
+  cv.addEventListener('wheel', (ev) => {
+    ev.preventDefault();
+    const p = canvasPoint(ev);
+    zoomAbout(p.x, p.y, ev.deltaY < 0 ? 0.8 : 1.25);
+  }, { passive: false });
+  cv.addEventListener('dblclick', () => { view = fullView(); requestRender(); });
+  // bonus keys carried over from interactive_2d.py
+  window.addEventListener('keydown', (ev) => {
+    if (ev.key === '+' || ev.key === '=') {
+      $('lowMult').value = Math.max(1, Number($('lowMult').value) * 0.6);
+      $('lowMult').dispatchEvent(new Event('input'));
+    } else if (ev.key === '-' || ev.key === '_') {
+      $('lowMult').value = Math.min(50, Number($('lowMult').value) / 0.6);
+      $('lowMult').dispatchEvent(new Event('input'));
+    } else if (ev.key === 'v') {
+      $('showPeaks').checked = !$('showPeaks').checked;
+      requestRender();
+    } else if (ev.key === 'r' || ev.key === 'o') {
+      view = fullView();
+      requestRender();
+    }
+  });
+  window.addEventListener('resize', requestRender);
+}
+let peaksShown = false;
+(async function init() {
+  try {
+    META = await fetchJSON('/api/meta');
+    GRID.nx = META.shape[1];  // F2 columns
+    GRID.ny = META.shape[0];  // F1 rows
+    peaks.x = META.peaks.x; peaks.y = META.peaks.y; peaks.rows = META.peaks.rows || [];
+    ITEMS.push({ key: 'spectrum', label: 'Spectrum', color: '#111' });
+    if (META.p3) ITEMS.push({ key: 'p3', label: 'P3 probability', color: '#1f77b4' });
+    for (const it of ITEMS) byKey.set(it.key, it);
+    const axisRes = await fetch('/api/bin/f2ppm');
+    ppm = new Float32Array(await axisRes.arrayBuffer());
+    const f1Res = await fetch('/api/bin/f1hz');
+    f1hz = new Float32Array(await f1Res.arrayBuffer());
+    $('meta').textContent =
+      `${GRID.ny}×${GRID.nx} (x=F2 ppm, y=F1 Hz) · ${peaks.x.length} picos · ` +
+      (META.source ? META.source.peakSource : '');
+    bindEvents();
+    buildSidebar();
+    await select(ITEMS[0].key);
+  } catch (err) {
+    $('meta').textContent = `error: ${err.message}`;
+  }
+})();
+</script>
+</body>
+</html>
