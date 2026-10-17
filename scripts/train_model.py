@@ -17,6 +17,20 @@ Uso:
   python3 scripts/train_model.py --data data/train_2d_elong --init Trained/Probability_2D/US/DNN_0 --lr 1e-4
   # desde cero:
   python3 scripts/train_model.py --data data/train_2d_elong --lr 1e-3
+
+Fondo del entrenamiento: no se muestrea uniforme. La etiqueta es un marcador
+sub-pixel (1/2/4 px por pico) sobre picos de ~20-50 px, así que los ceros dentro
+del pico son donde están los falsos positivos; muestrearlos uniforme los dejaba
+al 0.48 % del fondo (578 positivos por ~11 negativos a 1 px en cada época) y el
+modelo entrenado daba P > 0,5 al 81 % de los vecinos inmediatos de un pico.
+`--hard-frac` (0.25 por defecto) reserva esa fracción del fondo al anillo
+(`d <= --hard-px`), usando las distancias que guarda preextract.py en `d`.
+
+Copia de pesos (`--init`): POR ROL, derivado del grafo del SavedModel base
+(scripts/weight_roles.py). Emparejar por forma o por nombre no vale: las dos
+ramas y todos los niveles comparten formas y el orden en que un SavedModel lista
+sus variables no es el de creación, así que el fine-tune arrancaba con los brazos
+cruzados (48 de 62 pesos) y una BCE peor que aleatoria.
 """
 import argparse
 import json
@@ -37,32 +51,47 @@ except ImportError:  # older checkout without the module
     split_2d_rows = None
     HAVE_FAST_SPLIT = False
 
+from hard_negatives import (HARD_FRAC, HARD_PX, choose_background,  # noqa: E402
+                           distance_to_positive)
+
 SHAPE = (256, 2048)
 CROSS = np.array([64, 64])
 
 
 def build_model(filter_n=10):
-    import tensorflow as tf
+    """Modelo WNN_2D del material suplementario.
 
-    def WNN(layer, filt):
+    Además del modelo, deja `model.weight_roles`: una lista con el rol funcional
+    de cada peso en el MISMO orden que `model.weights`. Es lo que permite a
+    `weight_roles.assign_weights` copiar los pesos de un SavedModel base POR ROL
+    (`--init`): ni la forma ni el nombre sirven para emparejarlos, porque las dos
+    ramas y todos los niveles comparten formas y el orden en que un SavedModel
+    lista sus variables no es el de creación (ver scripts/weight_roles.py).
+    """
+    import tensorflow as tf
+    created = []          # [(capa, rol)] en orden de creación
+
+    def WNN(layer, filt, arm):
         def inner(x):
-            for _ in range(layer):
-                t = tf.keras.layers.Conv1D(filt, kernel_size=2, strides=2,
-                                           activation="tanh")(x)
-                s = tf.keras.layers.Conv1D(filt, kernel_size=2, strides=2,
-                                           activation="sigmoid")(x)
-                x = t * s
+            for lvl in range(1, layer + 1):
+                t_layer = tf.keras.layers.Conv1D(filt, kernel_size=2, strides=2,
+                                                 activation="tanh")
+                s_layer = tf.keras.layers.Conv1D(filt, kernel_size=2, strides=2,
+                                                 activation="sigmoid")
+                created.append((t_layer, f"conv|{arm}|{lvl}|t"))
+                created.append((s_layer, f"conv|{arm}|{lvl}|s"))
+                x = t_layer(x) * s_layer(x)
             return x
         return inner
 
     def DNN(filt):
         def inner(x):
-            t = tf.keras.layers.Dense(2 * filt, activation="tanh")(x)
-            s = tf.keras.layers.Dense(2 * filt, activation="sigmoid")(x)
-            x = t * s
-            t = tf.keras.layers.Dense(filt, activation="tanh")(x)
-            s = tf.keras.layers.Dense(filt, activation="sigmoid")(x)
-            x = t * s
+            for block, units in enumerate((2 * filt, filt)):
+                t_layer = tf.keras.layers.Dense(units, activation="tanh")
+                s_layer = tf.keras.layers.Dense(units, activation="sigmoid")
+                created.append((t_layer, f"dense|{block}|t"))
+                created.append((s_layer, f"dense|{block}|s"))
+                x = t_layer(x) * s_layer(x)
             return x
         return inner
 
@@ -74,32 +103,89 @@ def build_model(filter_n=10):
     x = tf.keras.layers.Lambda(lambda t: K.softsign(10 * t),
                                  output_shape=(size[0] + size[1], 1))(inp)
     # Slicing con forma estatica explicita (K.split pierde la longitud en Keras 3).
+    # La 1ª mitad del cross es el brazo F1 (el elongado); la 2ª, el F2.
     x_0 = tf.keras.layers.Lambda(lambda t: t[:, :size[0], :],
                                  output_shape=(size[0], 1))(x)
     x_1 = tf.keras.layers.Lambda(lambda t: t[:, size[0]:, :],
                                  output_shape=(size[1], 1))(x)
-    x_0 = WNN(nlev[0], filter_n)(x_0)
-    x_1 = WNN(nlev[1], filter_n)(x_1)
-    x_0 = tf.keras.layers.Conv1D(2 * filter_n, kernel_size=1)(x_0)
-    x_1 = tf.keras.layers.Conv1D(2 * filter_n, kernel_size=1)(x_1)
+    x_0 = WNN(nlev[0], filter_n, "F1")(x_0)
+    x_1 = WNN(nlev[1], filter_n, "F2")(x_1)
+    fus_0 = tf.keras.layers.Conv1D(2 * filter_n, kernel_size=1)
+    fus_1 = tf.keras.layers.Conv1D(2 * filter_n, kernel_size=1)
+    created += [(fus_0, "fus|F1"), (fus_1, "fus|F2")]
+    x_0 = fus_0(x_0)
+    x_1 = fus_1(x_1)
     out = tf.keras.layers.Lambda(lambda ts: K.squeeze(K.concatenate(ts, axis=-1), axis=1))([x_0, x_1])
     out = DNN(filter_n)(out)
-    out = tf.keras.layers.Dense(1, activation="sigmoid", name="dense_14")(out)
-    return tf.keras.Model(inputs=inp, outputs=out)
+    head = tf.keras.layers.Dense(1, activation="sigmoid", name="dense_14")
+    created.append((head, "out"))
+    out = head(out)
+    model = tf.keras.Model(inputs=inp, outputs=out)
+    model.weight_roles = _weight_roles(model, created)
+    return model
 
 
-def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng):
+def _weight_roles(model, created):
+    """Rol de cada peso, en el MISMO orden que model.weights."""
+    by_path = {}
+    for layer, role in created:
+        by_path[layer.kernel.path] = role + "|k"
+        if getattr(layer, "bias", None) is not None:
+            by_path[layer.bias.path] = role + "|b"
+    missing = [w.path for w in model.weights if w.path not in by_path]
+    if missing or len(by_path) != len(model.weights):
+        raise ValueError(
+            f"roles incompletos: {len(by_path)} roles para {len(model.weights)} "
+            f"pesos (sin rol: {missing})")
+    return [by_path[w.path] for w in model.weights]
+
+
+def _pools_missing_d(pre_dir, ids):
+    """Ids del pool cuyo `.npz` no guarda las distancias al pico (`d`).
+
+    Los pools generados antes del minado de negativos duros no las tienen, y sin
+    ellas `--hard-frac` no puede hacer nada: mejor avisar que entrenar en
+    silencio con el fondo uniforme de siempre. Se comprueban TODOS los ids, no
+    solo el primero: un pool mezclado (unos con `d` y otros sin) entrenaría con
+    fondo uniforme en unos espectros sin decir nada.
+    """
+    missing = []
+    for sid in ids:
+        path = os.path.join(pre_dir, f"{sid}.npz")
+        if not os.path.isfile(path):
+            missing.append(sid)
+            continue
+        with np.load(path) as z:
+            if "d" not in z:
+                missing.append(sid)
+    return missing
+
+
+def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
+                   hard_frac=0.0, hard_px=HARD_PX):
     """Muestreo por época desde un pool pre-extraído.
 
     Toma TODOS los positivos (filas 0:n_pos) + `bg_ratio * n_pos` filas de
-    fondo elegidas al azar del pool (filas n_pos:). Como el pool tiene
+    fondo elegidas del pool (filas n_pos:). Como el pool tiene
     `pool_k * n_pos` filas de fondo, con pool_k > bg_ratio cada época ve un
     subconjunto distinto -> se conserva la aumentación de fondo sin volver a
     pagar split_2d. Si pool_k == bg_ratio se toman todas las filas del pool
     (equivalente al muestreo fijo; ver tests/test_pool_equiv.py).
+
+    `d` son las distancias al positivo más cercano de esas filas de fondo
+    (las guarda preextract.py). Con `hard_frac > 0` esa fracción del fondo sale
+    del anillo del pico (`d <= hard_px`) en vez de uniforme sobre todo el fondo:
+    sin esto los ceros dentro del pico entraban al 0,48 % y el modelo acababa
+    dando P > 0,5 al 81 % de los vecinos inmediatos de un pico. Sin `d` (pool
+    antiguo) o con `hard_frac=0` el sorteo es el histórico, intacto.
     """
-    n_bg = min(len(X) - n_pos, int(n_pos * bg_ratio), max_pts - n_pos)
-    bg = rng.choice(len(X) - n_pos, size=max(0, n_bg), replace=False) + n_pos
+    n_bg = max(0, min(len(X) - n_pos, int(n_pos * bg_ratio), max_pts - n_pos))
+    if d is not None and hard_frac > 0 and n_bg > 0:
+        cand = np.arange(n_pos, len(X))
+        d_bg = np.asarray(d)[:len(cand)]
+        bg = cand[choose_background(cand, d_bg, n_bg, hard_frac, hard_px, rng)]
+    else:
+        bg = rng.choice(len(X) - n_pos, size=n_bg, replace=False) + n_pos
     idx = np.concatenate([np.arange(n_pos), bg])
     rng.shuffle(idx)
     return X[idx], y[idx]
@@ -110,10 +196,17 @@ class BinSequence:
 
     Por epoca recorre n espectros; de cada uno muestrea hasta max_pts puntos
     (todos los positivos + submuestra de fondo hasta completar) para acotar RAM.
+
+    Los atributos del fondo van también a nivel de clase porque los tests
+    construyen la secuencia sin `__init__` (como ya hacían con `preextracted`).
     """
 
+    hard_frac = 0.0
+    hard_px = HARD_PX
+
     def __init__(self, ds_dir, ids, batch=65536, max_pts=65536, seed=0,
-                 shuffle=True, bg_ratio=4.0, fast_split=True):
+                 shuffle=True, bg_ratio=4.0, fast_split=True,
+                 hard_frac=0.0, hard_px=HARD_PX):
         import tensorflow as tf
         self.ds_dir = ds_dir
         self.ids = list(ids)
@@ -122,6 +215,8 @@ class BinSequence:
         self.rng = np.random.default_rng(seed)
         self.shuffle = shuffle
         self.bg_ratio = bg_ratio
+        self.hard_frac = hard_frac
+        self.hard_px = hard_px
         self.tf = tf
         # Por defecto solo se calculan las filas muestreadas (split_2d_rows,
         # bit-identico, ~60x menos trabajo); --slow-split usa la matriz
@@ -178,10 +273,17 @@ class BinSequence:
         """
         y = L.reshape(-1, 1)
         pos = np.where(y[:, 0] > 0.5)[0]
-        n_bg = min(len(y) - len(pos), int(len(pos) * self.bg_ratio),
-                   self.max_pts - len(pos))
+        n_bg = max(0, min(len(y) - len(pos), int(len(pos) * self.bg_ratio),
+                          self.max_pts - len(pos)))
         neg = np.where(y[:, 0] < 0.5)[0]
-        take_neg = self.rng.choice(neg, size=max(0, n_bg), replace=False)
+        if self.hard_frac > 0:
+            # ruta sin pre-extraccion: la distancia se calcula aquí mismo
+            d_flat = distance_to_positive(L).reshape(-1)
+            take_neg = neg[choose_background(neg, d_flat[neg], n_bg,
+                                             self.hard_frac, self.hard_px,
+                                             self.rng)]
+        else:
+            take_neg = self.rng.choice(neg, size=max(0, n_bg), replace=False)
         idx = np.concatenate([pos, take_neg])
         self.rng.shuffle(idx)
         if self.fast_split:
@@ -198,10 +300,12 @@ class BinSequence:
         with np.load(os.path.join(base, f"{sid}.npz")) as z:
             X, y = z["X"], z["y"]
             n_pos = int(z["n_pos"]) if "n_pos" in z else None
+            d = z["d"] if "d" in z else None
         if n_pos is None:  # formato antiguo: muestra fija, ya es final
             return np.ascontiguousarray(X), np.ascontiguousarray(y)
         Xs, ys = subsample_pool(X, y, n_pos, self.max_pts, self.bg_ratio,
-                                self.rng)
+                                self.rng, d=d, hard_frac=self.hard_frac,
+                                hard_px=self.hard_px)
         return np.ascontiguousarray(Xs), np.ascontiguousarray(ys)
 
     def __iter__(self):
@@ -380,6 +484,15 @@ def main():
     ap.add_argument("--max-pts", type=int, default=65536)
     ap.add_argument("--bg-ratio", type=float, default=4.0,
                     help="fondo por cada positivo (4=paper-like, 2=mas agresivo)")
+    ap.add_argument("--hard-frac", type=float, default=HARD_FRAC,
+                    help=f"fracción del fondo de cada época que sale del anillo "
+                         f"del pico (d <= --hard-px) en vez de uniforme sobre "
+                         f"todo el fondo; {HARD_FRAC} por defecto, 0 = fondo "
+                         f"uniforme. Requiere un pool con distancias "
+                         f"(preextract.py --hard-frac)")
+    ap.add_argument("--hard-px", type=int, default=HARD_PX,
+                    help=f"radio en px del anillo considerado 'negativo duro' "
+                         f"({HARD_PX})")
     ap.add_argument("--n-train", type=int, default=None,
                     help="usa solo los primeros N espectros de train (pruebas rapidas)")
     ap.add_argument("--n-val", type=int, default=None,
@@ -416,24 +529,15 @@ def main():
         print("pesos restaurados exactos (incluye optimizer si se reanuda con compile previo)")
     elif args.init:
         print(f"fine-tune desde {args.init}")
-        base = tf.keras.Sequential([
-            tf.keras.layers.InputLayer(shape=(128, 1)),
-            tf.keras.layers.TFSMLayer(args.init, call_endpoint="serving_default")])
-        # Los nombres difieren (conv1d vs conv1d_52...): copiar por FORMA en orden.
-        # Los pesos base vienen intercalados kernel/bias; emparejar secuencialmente
-        # cada peso del modelo nuevo con el siguiente peso base de igual forma.
-        pool = {}
-        for w in base.weights:
-            pool.setdefault(tuple(w.shape), []).append(w)
-        copied, skipped = 0, 0
-        for w in model.weights:
-            cands = pool.get(tuple(w.shape), [])
-            if cands:
-                w.assign(cands.pop(0).numpy())
-                copied += 1
-            else:
-                skipped += 1
-        print(f"pesos copiados: {copied}, aleatorios: {skipped}")
+        # Copia POR ROL, no por forma ni por nombre: las dos ramas y todos los
+        # niveles comparten formas, y el orden en que el SavedModel lista sus
+        # variables no es el de creación. Emparejar por forma asignaba a cada
+        # brazo los pesos del otro (48/62 pesos) y el fine-tune arrancaba peor que
+        # aleatorio (BCE 1,04 frente a 0,35 del modelo base). Ver weight_roles.py.
+        from weight_roles import assign_weights
+        copied, skipped = assign_weights(model, args.init)
+        print(f"pesos copiados por rol: {copied}/{len(model.weights)}, "
+              f"aleatorios: {skipped}")
     model.compile(loss=tf.keras.losses.BinaryCrossentropy(),
                   optimizer=tf.keras.optimizers.Adam(learning_rate=lr),
                   metrics=[tf.keras.metrics.BinaryAccuracy(name="acc"),
@@ -446,11 +550,13 @@ def main():
     train_seq = BinSequence(ds_dir, train_ids, batch=args.batch,
                             max_pts=args.max_pts, seed=args.seed, shuffle=True,
                             bg_ratio=args.bg_ratio,
-                            fast_split=not args.slow_split)
+                            fast_split=not args.slow_split,
+                            hard_frac=args.hard_frac, hard_px=args.hard_px)
     val_seq = BinSequence(ds_dir, val_ids, batch=args.batch,
                           max_pts=args.max_pts, seed=args.seed + 1, shuffle=False,
                           bg_ratio=args.bg_ratio,
-                          fast_split=not args.slow_split)
+                          fast_split=not args.slow_split,
+                          hard_frac=args.hard_frac, hard_px=args.hard_px)
     if not args.preextracted:
         used = ("por filas (split_2d_rows)" if train_seq.fast_split
                 else "completo (--slow-split)")
@@ -464,6 +570,17 @@ def main():
         print(f"modo pre-extraído: {man.get('storage', '')} "
               f"(seed={man.get('seed')}, pool_k={man.get('pool_k')}, "
               f"bg_ratio/época={args.bg_ratio})")
+        pool_ids = list(man.get("train", [])) + list(man.get("val", []))
+        sin_d = _pools_missing_d(args.data, pool_ids) if args.hard_frac > 0 else []
+        if sin_d:
+            raise SystemExit(
+                f"ERROR: {len(sin_d)}/{len(pool_ids)} pools de {args.data} no "
+                f"guardan las distancias al pico (`d`) (p.ej. {sin_d[:3]}), así "
+                f"que no se puede minar el anillo: esos espectros entrenarían "
+                f"con fondo uniforme sin avisar. Regenera el pool con "
+                f"scripts/preextract.py --hard-frac {args.hard_frac} "
+                f"--hard-px {args.hard_px}, o entrena con --hard-frac 0 para "
+                f"usar el fondo uniforme de siempre.")
     os.makedirs(args.out, exist_ok=True)
     # --scratch: el entrenamiento escribe en local y se sincroniza a --out.
     ckpt_dir = args.scratch or args.out
@@ -500,6 +617,10 @@ def main():
     with open(os.path.join(args.out, "history.txt"), "w") as f:
         for tr, va in h:
             f.write(f"{tr:.6e} {va:.6e}\n")
+    # Keras 3 expone la ultima Dense como 'output_0', no con su nombre
+    # ('dense_14' en los SavedModels originales de Keras 2). Los consumidores
+    # (StoP3.Production_2D/3D, run_51.py) usan model_output.single_output y no
+    # dependen de la clave.
     model.export(args.out + "_savedmodel")
     print(f"OK -> {args.out} (+ {args.out}_savedmodel), history.npy {h.shape}")
     # verificacion estilo inferencia StoP3

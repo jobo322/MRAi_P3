@@ -50,11 +50,12 @@ conda install jupyter
 
 ### Installation on Apple Silicon (M1/M2/M3) — local, native
 
-> The original wheel pins `tensorflow==2.13` and `numpy==1.24`,
+> The original wheel (v1.0.0) pinned `tensorflow==2.13` and `numpy==1.24`,
 > which **crash** on Apple Silicon with
 > `The TensorFlow library was compiled to use AVX instructions… Abort`.
 > The fix is to use the **current** TensorFlow (2.15+) which ships
-> native macOS arm64 wheels.
+> native macOS arm64 wheels — from v1.1.0 on the wheel declares
+> `tensorflow >=2.13,<3`, so `pip` resolves a recent arm64-native release.
 
 Two supported routes are given below; **pick one**.
 
@@ -68,14 +69,15 @@ Requirements:
 # 1. install a supported Python
 pyenv install 3.12          # TF 2.21 supports 3.10–3.13
 pyenv virtualenv 3.12 mrai_p3
-mkdir -p ~/projects/tf_playground && cd $_
-pyenv local mrai_p3          # writes .python-version
+cd /full/path/to/MRAi_P3    # your clone/unzip folder — NOT a scratch dir:
+                            # the remaining commands assume they run in it
+pyenv local mrai_p3          # writes .python-version here (gitignored)
 
 # 2. upgrade pip / tooling
 python -m pip install --upgrade pip setuptools wheel
 
 # 3. install TensorFlow for Apple Silicon (native cpu + gpu support)
-pip install tensorflow       # >=2.13  ✓ arm64
+pip install tensorflow       # >=2.15  ✓ arm64
 
 # 4. install MRAi_P3 from the patched wheel for TensorFlow 2.15+ / Keras 3
 pip install ~/git/mrai_p3/mrai_p3-1.1.2-py3-none-any.whl
@@ -178,7 +180,19 @@ jupyter notebook
 
 ## Training the Model Locally (Retraining Pipeline)
 
-To retrain/fine-tune the 2D-US peak-probability model on your own machine — background-pool pre-extraction (`scripts/preextract.py`) followed by the full 210-epoch run (`scripts/train_model.py`) — follow the validated step-by-step guide in [docs/local_training.md](docs/local_training.md). The same pipeline on a Colab GPU is documented in [colab/COLAB.md](colab/COLAB.md).
+To retrain/fine-tune the 2D-US peak-probability model on your own machine — background-pool pre-extraction (`scripts/preextract.py`) followed by the full 210-epoch run (`scripts/train_model.py`) — follow the validated step-by-step guide in [docs/local_training.md](docs/local_training.md). The same guide as a runnable Jupyter notebook is [docs/local_training.ipynb](docs/local_training.ipynb). The same pipeline on a Colab GPU is documented in [colab/COLAB.md](colab/COLAB.md).
+
+**Prerequisites:** any Python 3.10–3.13 environment with TensorFlow ≥ 2.15 (arm64-native) — the `mrai_p3` environment created in the *Installation* section above qualifies; [docs/local_training.md](docs/local_training.md) §1 shows how to build a dedicated one if you prefer. The training scripts need only TensorFlow + NumPy and this repository checkout (the wheel is not required for training).
+
+**Check that you are ready to train** — run from the repository folder:
+
+```bash
+python -c "import tensorflow as tf; print('TF', tf.__version__)"   # need >= 2.15
+python scripts/preextract.py --help    # prints usage = OK
+python scripts/train_model.py --help   # prints usage = OK
+```
+
+If all three pass, start with Step 1 of [docs/local_training.md](docs/local_training.md).
 
 ---
 

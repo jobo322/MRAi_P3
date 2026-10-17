@@ -8,10 +8,14 @@ background pool once, then run the complete 210-epoch fine-tune.
 * **Validated:** 2026-10-15 on a MacBook Air M1 (8 cores, 16 GB, macOS 26.6.2),
   CPU only (`GPUs: []`). Every command below was executed successfully on that
   machine (1-epoch full smoke: 35/35 steps, 62/62 weights copied from the
-  fine-tune base, `val_loss 0.675`).
+  fine-tune base **by role**, `val_loss 0.675`).
 * **Companion docs:** `colab/COLAB.md` (same pipeline on Colab GPU),
   `docs/session_checkpoint_2026-10-14.md` (Phase 1 state), and
   `odd/tasks/PLAN_split_rows.md` (measurements behind the row-wise split).
+* **Executable version:** `docs/local_training.ipynb` — the same steps as a
+  runnable Jupyter notebook, with each stage checking its own result. It finds
+  a Python that can `import tensorflow` by itself, so it works even from the
+  Jupyter env that has no TensorFlow installed (see §1).
 
 ---
 
@@ -19,17 +23,31 @@ background pool once, then run the complete 210-epoch fine-tune.
 
 | Stage | Script | Cost | When |
 |---|---|---|---|
-| **Pre-extraction** | `scripts/preextract.py` | minutes, once | whenever `--pool-k`/`--seed` change |
+| **Pre-extraction** | `scripts/preextract.py` | minutes, once | whenever `--pool-k`/`--seed`/`--hard-frac` change |
 | **Training** | `scripts/train_model.py` | ~1–1.5 h for 210 epochs | every retrain |
 
 **Why pre-extract?** The training set is built from cross-sections ("rows") of
 each 256×2048 spectrum. The expensive `split_2d` work is *deterministic*; only
 the background sampling is random. `preextract.py` runs the split **once** per
-spectrum and stores a pool with ALL positives plus `pool_k × n_pos` background
-pixels (fixed `--seed`). Training then subsamples that pool every epoch
-(`bg_ratio` background per positive, fresh rng), so the background still varies
-per epoch while the split is never recomputed. See `colab/COLAB.md` §4 for the
-full rationale and pool-size table.
+spectrum and stores a pool with ALL positives plus the background budget
+(`pool_k × n_pos` rows, fixed `--seed`). Training then subsamples that pool every
+epoch (`bg_ratio` background per positive, fresh rng), so the background still
+varies per epoch while the split is never recomputed. See `colab/COLAB.md` §4 for
+the full rationale and pool-size table.
+
+**The background budget is not uniform.** The label is a sub-pixel marker (1/2/4
+px per peak, 2.26 on average) while a peak spans ~20–50 px, so the zeros *inside*
+a peak are where the false positives live. Sampling the background uniformly over
+all zeros put them at 0.48 % of the pool: per epoch and spectrum, 578 positives
+against ~11 negatives 1 px away and ~26 within 2 px, with 96.7 % of the
+background ≥5 px from any peak (where the model is already almost perfect). The
+measured consequence on the trained model: **81 % of the zeros right next to a
+peak got P > 0.5**, the learned boundary sat at ~2–3 px instead of the label's
+~0.5–1 px, and the peak list came out ~7.7× too long (1 966 picks where there
+were 256). `--hard-frac` reserves a share of the background for that ring
+(`d <= --hard-px`), and every pool row stores its distance to the nearest peak in
+`d` so the per-epoch share can be tuned at training time without regenerating the
+pool.
 
 ---
 
@@ -42,18 +60,38 @@ full rationale and pool-size table.
 * A Phase 1 manifest with the 800/200 train/val split:
   `data/train_2d_elong/manifest.json` (produced by `scripts/jres_ingest.py`;
   see `colab/COLAB.md` §3 if you need to regenerate it).
-* A TensorFlow environment. On this Mac the working one is the **pyenv
-  virtualenv `tflow`** (Python 3.13.2, TF 2.21.0, Keras 3.15.1):
+* A TensorFlow environment. **Any Python 3.10–3.13 environment with
+  TensorFlow ≥ 2.15 works** (arm64-native wheel) — the `mrai_p3` env from the
+  README *Installation* section qualifies. The `MRAi_P3` wheel is **not**
+  required for training: `scripts/*.py` only need TensorFlow + NumPy and this
+  checkout. On this Mac the working env is the dedicated **pyenv virtualenv
+  `tflow`** (Python 3.13.2, TF 2.21.0, Keras 3.15.1). If you don't have it
+  yet:
+
+```bash
+pyenv install 3.13                 # if that Python isn't installed yet
+pyenv virtualenv 3.13 tflow        # needs the pyenv-virtualenv plugin
+                                   # (brew install pyenv-virtualenv)
+pyenv activate tflow
+python -m pip install --upgrade pip
+python -m pip install tensorflow   # >=2.15, native arm64
+```
+
+Then verify the environment **and** the training scripts, from the repository
+folder:
 
 ```bash
 cd /Users/abolanos/git/mrai_p3
-pyenv activate tflow
+pyenv activate tflow                # or: conda activate mrai_p3
 python -c "import tensorflow as tf; print(tf.__version__)"   # -> 2.21.0
+python scripts/preextract.py --help    # prints usage = ready
+python scripts/train_model.py --help   # prints usage = ready
 ```
 
-> **Pitfall:** the default env (`jres`) has **no TensorFlow**. Always
-> `pyenv activate tflow` and invoke **`python`**, not `python3` (the shim
-> resolves elsewhere).
+> **Pitfall:** on this machine the default env (`jres`) has **no
+> TensorFlow**. Always activate the TF env explicitly (`pyenv activate
+> tflow`, or `conda activate mrai_p3` if you built it per the README) and
+> invoke **`python`**, not `python3` (the shim resolves elsewhere).
 
 ---
 
@@ -67,8 +105,13 @@ python scripts/preextract.py \
   --dataset /Users/abolanos/git/cheminfo/spectrum-generator/dataset \
   --ids data/train_2d_elong/manifest.json \
   --out data/pre_elong \
-  --seed 0 --pool-k 10 --fast
+  --seed 0 --pool-k 10 --hard-frac 0.25 --hard-px 2 --fast
 ```
+
+* `--hard-frac` (default **0.25**) reserves that share of the pool's background
+  for negatives within `--hard-px` px of a peak; `--hard-frac 0` reproduces the
+  old uniform background byte for byte (the pinned pool in
+  `tests/test_split_rows.py`).
 
 * `--fast` is a **no-op** now (the row-wise `split_2d_rows` is the default
   path); it is kept so the Colab notebook keeps working. `--slow-split` forces
@@ -81,9 +124,13 @@ python scripts/preextract.py \
 
 | File | Content |
 |---|---|
-| `<id>.npz` | `X` (M,128,1) float32, `y` (M,1), `n_pos`, `H`, `W` — ~3.3 MB each, **~3.0 GB total** for 1000 spectra |
-| `manifest.json` | `{source, seed, pool_k, max_pts, shape, train, val}` — this is what `train_model.py --data` reads |
-| `preextract.log` | CSV: `id, split, M, pos, seconds` |
+| `<id>.npz` | `X` (M,128,1) float32, `y` (M,1), `n_pos`, `d` (uint8, distance to the nearest peak of each background row), `hard_px`, `H`, `W` — ~3.3 MB each, **~3.0 GB total** for 1000 spectra |
+| `manifest.json` | `{source, seed, pool_k, hard_frac, hard_px, max_pts, shape, train, val}` — this is what `train_model.py --data` reads |
+| `preextract.log` | CSV: `id, split, M, pos, hard, seconds` |
+
+> **Pools written before the ring existed have no `d`.** `train_model.py` refuses
+to run with `--hard-frac > 0` on such a pool (it would silently train with the
+uniform background); regenerate it, or pass `--hard-frac 0`.
 
 M (pool rows) = `n_pos + pool_k × n_pos` ≈ 5600–7000 (measured avg **6334**).
 
@@ -122,7 +169,9 @@ Key flags:
 | Flag | Meaning |
 |---|---|
 | `--preextracted` | read the `<id>.npz` pools from `--data` instead of `.bin` + on-demand split; `--bg-ratio` controls the per-epoch subsampling |
-| `--init .../DNN_0` | fine-tune from the 2D-US base SavedModel (weights copied **by shape**, 62/62 on this dataset). Omit `--init` and pass `--lr 1e-3` to train from scratch |
+| `--init .../DNN_0` | fine-tune from the 2D-US base SavedModel. The weights are copied **by role** (`scripts/weight_roles.py`, derived from the base's graph): 62/62, and copying them reproduces the base to `maxdiff < 1e-6` (`tests/test_init_weights.py`). Omit `--init` and pass `--lr 1e-3` to train from scratch |
+| `--hard-frac` | share of each epoch's background drawn from the ring (`d <= --hard-px`) instead of uniformly; default 0.25, 0 = old uniform background |
+| `--hard-px` | radius in px of the ring treated as a hard negative (default 2) |
 | `--bg-ratio 4` | paper-like background: M ≈ 581×5 ≈ **2905** points/spectrum → **35 train / 8 val steps** per epoch with `--batch 65536` |
 | `--patience 20` | early stopping on `val_loss` (the 15-oct run never triggered it — it was still improving) |
 
@@ -138,6 +187,27 @@ epoch** → 210 epochs ≈ **1–1.5 h** (consistent with `colab/COLAB.md` §4:
 * `<out>_savedmodel/` — `model.export()` SavedModel (what StoP3 consumes),
   written at the end of training
 * plus a final `predict smoke` line as an inference sanity check
+
+### Looking at the result on the training data
+
+`scripts/plotting/run_train_2d.py` runs the same inference and peak chain as
+the folder-51 workflow (`run_51.py`: `P3toP5` -> `P5toPeaks` -> `PeakstoTab`),
+but on one of the training spectra, so you can see what the model does on data
+it has already seen:
+
+```bash
+python scripts/plotting/run_train_2d.py --id 1 \
+    --model Trained/Probability_2D_Elongated/DNN_0_local_savedmodel
+node scripts/plotting/view2d.mjs --out /tmp/train_p3/1/view2d
+```
+
+It writes the peak list, a PNG (spectrum + P3 + ground truth + detections) and
+a match report against `dataset/manifest.jsonl`. Measured on spectrum 1 with
+the elongated model: **recall 0.617 / precision 0.735**, and the candidate
+mask dominates recall — `--spe-the 0.2` reaches recall 0.828 but drops
+precision to 0.640. The model also calls **84 % of the candidate pixels in the
+2-pixel ring around a label a peak** (`P > 0.5`), which is the over-detection
+`--hard-frac` was introduced to fight.
 
 ---
 

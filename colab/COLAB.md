@@ -68,7 +68,7 @@ python scripts/jres_ingest.py --dataset /content/dataset --out /content/staged -
 python scripts/jres_ingest.py --dataset /content/dataset --out /content/staged
 python scripts/train_model.py --data /content/staged --max-pts 4096 --epochs 1 --batch 4096 --out /content/smoke
 # pre-extraccion: pool de fondo (celda 4b), una vez, ~11-16 s
-python scripts/preextract.py --dataset /content/dataset --ids /content/staged/manifest.json --out /content/pre --seed 0 --pool-k 10 --fast
+python scripts/preextract.py --dataset /content/dataset --ids /content/staged/manifest.json --out /content/pre --seed 0 --pool-k 10 --hard-frac 0.25 --hard-px 2 --fast
 # fine-tune sobre pre-extraido (celda 5). --scratch: escribe en local y
 # sincroniza a $OUT cada 5 epocas (ver §7)
 python scripts/train_model.py --data /content/pre --preextracted --init /content/init/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 --epochs 210 --patience 20 --out $OUT --scratch /content/out --sync-every 5
@@ -128,7 +128,10 @@ sigue pagándose sola: el *break-even* son ~4 épocas y en un run completo
 `split_2d` es determinista; el muestreo de fondo es lo aleatorio. Se separan:
 
 * **Caro y determinista** (una vez): `preextract.py` guarda por espectro
-  TODOS los positivos (filas `0:n_pos`) + `pool_k × n_pos` píxeles de fondo.
+  TODOS los positivos (filas `0:n_pos`) + el presupuesto de fondo
+  (`pool_k × n_pos` filas), reservando `--hard-frac` (0.25 por defecto) al anillo
+del pico (`d <= --hard-px`) en vez de muestrear uniforme, y guarda en `d` la
+distancia de cada fila de fondo a su pico más cercano.
 * **Barato y aleatorio** (cada época): `train_model.subsample_pool` toma
   todos los positivos + `bg_ratio × n_pos` filas del pool con un `rng` que
   avanza por época.
@@ -137,6 +140,14 @@ Con `pool_k > bg_ratio` cada época ve un subconjunto de fondo distinto →
 aumentación preservada sin repagar el split. Con `pool_k == bg_ratio` se
 toma el pool entero (equivalente al muestreo fijo); verificado en
 `tests/test_pool_equiv.py` (3 tests).
+
+El fondo no es uniforme: `--hard-frac` (0.25 por defecto, en `preextract.py` para
+el pool y en `train_model.py` para cada época) lo reserva al anillo del pico. La
+etiqueta es un marcador sub-píxel (1/2/4 px) sobre picos de ~20-50 px, así que el
+fondo uniforme dejaba los ceros de dentro del pico al 0,48 %: el modelo entrenado
+daba P > 0,5 al 81 % de los vecinos inmediatos de un pico y la lista de picos
+salía ~7,7× más larga. Los pools anteriores a esto no guardan `d`, así que
+`train_model.py` se niega a arrancar con `--hard-frac > 0` y pide regenerarlos.
 
 ### Tamaño del pool (medido, float32 npz sin comprimir)
 
