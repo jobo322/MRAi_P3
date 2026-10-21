@@ -30,6 +30,7 @@ from cross_extract import split_2d  # noqa: E402
 from cross_extract_fast import split_2d_fast, split_2d_rows  # noqa: E402
 from preextract import (build_pool, load_pair, plan_pool_idx,  # noqa: E402
                         CROSS, SHAPE)
+from hard_negatives import distance_to_positive  # noqa: E402
 from train_model import BinSequence  # noqa: E402  (TF is imported lazily)
 
 DATASET_DIR = os.environ.get(
@@ -223,13 +224,20 @@ class TestPreextractRegression(unittest.TestCase):
         man = json.load(open(os.path.join(POOL_DIR, "manifest.json")))
         ids = list(dict.fromkeys(man["train"] + man["val"]))[:3]
         self.assertTrue(ids, "pool manifest lists no spectra")
+        # El pool en disco manda: si se generó con el minado del anillo
+        # (--hard-frac > 0) hay que reproducir ESA selección y no la uniforme
+        # histórica. Con `hard_frac` ausente o 0 el camino es el de siempre.
+        hard = {}
+        if man.get("hard_frac"):
+            hard = {"hard_frac": float(man["hard_frac"]),
+                    "hard_px": int(man["hard_px"])}
         # same seed and same order as the original preextract run
         rng = np.random.default_rng(man["seed"])
         for sid in ids:
             with self.subTest(sid=sid):
                 S, L = load_pair(DATASET_DIR, sid)
                 idx, n_pos = plan_pool_idx(L, man["pool_k"], man["max_pts"],
-                                           rng)
+                                           rng, **hard)
                 X, _ = split_2d_rows(S, idx, CROSS)
                 X = np.asarray(X, dtype=np.float32)
                 X[~np.isfinite(X)] = 0.0
@@ -240,6 +248,15 @@ class TestPreextractRegression(unittest.TestCase):
                     self.assertTrue(np.array_equal(y, z["y"]), sid)
                     self.assertEqual(n_pos, int(z["n_pos"]), sid)
                     self.assertEqual(S.shape, SHAPE)
+                    if "d" in z.files:
+                        # El pool guarda la distancia al pico de cada fila de
+                        # fondo: es lo que permite minar el anillo por época
+                        # sin regenerarlo. Se fija también para que un cambio
+                        # silencioso en el trazado del anillo no pase.
+                        d_bg = distance_to_positive(L).reshape(-1)[idx[n_pos:]]
+                        self.assertTrue(np.array_equal(d_bg.astype(np.uint8), z["d"]),
+                                        sid)
+                        self.assertEqual(int(z["hard_px"]), hard.get("hard_px", 0))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,9 @@ al 0.48 % del fondo (578 positivos por ~11 negativos a 1 px en cada época) y el
 modelo entrenado daba P > 0,5 al 81 % de los vecinos inmediatos de un pico.
 `--hard-frac` (0.25 por defecto) reserva esa fracción del fondo al anillo
 (`d <= --hard-px`), usando las distancias que guarda preextract.py en `d`.
+`--hard-band2`/`--hard-frac2` añaden una banda media isotrópica y
+`--hard-aniso F1LO F1HI F2LO F2HI` la sustituye por un rectángulo por eje
+(d1/d2, también guardados por preextract.py --hard-aniso).
 
 Copia de pesos (`--init`): POR ROL, derivado del grafo del SavedModel base
 (scripts/weight_roles.py). Emparejar por forma o por nombre no vale: las dos
@@ -51,7 +54,8 @@ except ImportError:  # older checkout without the module
     split_2d_rows = None
     HAVE_FAST_SPLIT = False
 
-from hard_negatives import (HARD_FRAC, HARD_PX, choose_background,  # noqa: E402
+from hard_negatives import (HARD_FRAC, HARD_PX, aniso_band_mask,  # noqa: E402
+                           axis_distance_to_positive, choose_background,
                            distance_to_positive)
 
 SHAPE = (256, 2048)
@@ -161,8 +165,49 @@ def _pools_missing_d(pre_dir, ids):
     return missing
 
 
+def _pools_missing_pair(pre_dir, ids):
+    """Ids del pool cuyo `.npz` no guarda las marcas de pares apretados (`pair`).
+
+    Igual que `_pools_missing_d`: los pools generados sin `--pair-px` no traen
+    el array, y sin él `--pair-frac` no puede sobremuestrear nada. Se comprueban
+    TODOS los ids, no solo el primero: un pool mezclado (unos con `pair` y otros
+    sin) sobremuestrearía unos espectros y no otros sin decir nada.
+    """
+    missing = []
+    for sid in ids:
+        path = os.path.join(pre_dir, f"{sid}.npz")
+        if not os.path.isfile(path):
+            missing.append(sid)
+            continue
+        with np.load(path) as z:
+            if "pair" not in z:
+                missing.append(sid)
+    return missing
+
+
+def _pools_missing_axis_d(pre_dir, ids):
+    """Ids del pool cuyo `.npz` no guarda las distancias por eje (`d1`, `d2`).
+
+    Sin ellas `--hard-aniso` no puede construir la banda rectangular. Se
+    comprueban TODOS los ids para no entrenar unos espectros con la banda y
+    otros con el fondo uniforme sin avisar.
+    """
+    missing = []
+    for sid in ids:
+        path = os.path.join(pre_dir, f"{sid}.npz")
+        if not os.path.isfile(path):
+            missing.append(sid)
+            continue
+        with np.load(path) as z:
+            if "d1" not in z or "d2" not in z:
+                missing.append(sid)
+    return missing
+
+
 def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
-                   hard_frac=0.0, hard_px=HARD_PX):
+                   hard_frac=0.0, hard_px=HARD_PX, band2_px=None,
+                   band2_frac=0.0, pair=None, pair_frac=0.0,
+                   d1=None, d2=None, aniso=None):
     """Muestreo por época desde un pool pre-extraído.
 
     Toma TODOS los positivos (filas 0:n_pos) + `bg_ratio * n_pos` filas de
@@ -176,17 +221,65 @@ def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
     (las guarda preextract.py). Con `hard_frac > 0` esa fracción del fondo sale
     del anillo del pico (`d <= hard_px`) en vez de uniforme sobre todo el fondo:
     sin esto los ceros dentro del pico entraban al 0,48 % y el modelo acababa
-    dando P > 0,5 al 81 % de los vecinos inmediatos de un pico. Sin `d` (pool
-    antiguo) o con `hard_frac=0` el sorteo es el histórico, intacto.
+    dando P > 0,5 al 81 % de los vecinos inmediatos de un pico. Con
+    `band2_frac > 0` otra fracción sale de la banda media
+    (`hard_px < d <= band2_px`), que es donde el modelo no había visto negativos
+    (entró al pool al 0,5 % frente al 54 % del anillo) y donde caen los hombros
+    que se vuelven falsos positivos. Sin `d` (pool antiguo) o con las dos
+    fracciones a 0 el sorteo es el histórico, intacto.
+
+    `d1`/`d2` son las distancias por eje (las guarda `preextract.py
+    --hard-aniso`). Con `aniso=(F1LO, F1HI, F2LO, F2HI)` la banda media ya no
+    es isotrópica: se selecciona el rectángulo `F1LO <= d1 <= F1HI` y
+    `F2LO <= d2 <= F2HI`, siempre fuera del anillo. Sin `d1`/`d2` con `aniso`
+    se falla claro (pool antiguo o generado con --hard-band2).
+
+    `pair` son las marcas de PARES APRETADOS del pool (un byte por fila, lo
+    guarda preextract.py --pair-px > 0): filas cuyo píxel pertenece a un pico
+    enterrado en el flanco de uno mayor —un par que el perfil en cruz no puede
+    ver—. Con `pair_frac > 0` se añaden al lote `round(pair_frac * n_pos)` filas
+    extra sorteadas CON reemplazo de las marcadas, DESPUÉS del sorteo del fondo,
+    así que los negativos elegidos no cambian (solo se añaden filas marcadas) y
+    `n_bg` sigue calculándose sobre el `n_pos` ORIGINAL. Sin `pair` con
+    `pair_frac > 0` se falla claro.
     """
     n_bg = max(0, min(len(X) - n_pos, int(n_pos * bg_ratio), max_pts - n_pos))
-    if d is not None and hard_frac > 0 and n_bg > 0:
+    if aniso is not None and n_bg > 0:
+        if d is None or d1 is None or d2 is None:
+            raise ValueError(
+                "aniso necesita d, d1 y d2 del pool: regenera con "
+                "preextract.py --hard-aniso, o entrena sin --hard-aniso")
+        if band2_frac <= 0:
+            raise ValueError("aniso necesita band2_frac > 0")
+        if band2_px is not None:
+            raise ValueError("aniso y band2_px son excluyentes")
+    if d is not None and (hard_frac > 0 or band2_frac > 0) and n_bg > 0:
         cand = np.arange(n_pos, len(X))
         d_bg = np.asarray(d)[:len(cand)]
-        bg = cand[choose_background(cand, d_bg, n_bg, hard_frac, hard_px, rng)]
+        band2_mask = None
+        if aniso is not None:
+            d1_bg = np.asarray(d1)[:len(cand)]
+            d2_bg = np.asarray(d2)[:len(cand)]
+            band2_mask = aniso_band_mask(d1_bg, d2_bg, *aniso)
+        bg = cand[choose_background(cand, d_bg, n_bg, hard_frac, hard_px, rng,
+                                    band2_px=band2_px, band2_frac=band2_frac,
+                                    band2_mask=band2_mask)]
     else:
         bg = rng.choice(len(X) - n_pos, size=n_bg, replace=False) + n_pos
-    idx = np.concatenate([np.arange(n_pos), bg])
+    if pair_frac > 0:
+        if pair is None:
+            raise ValueError(
+                "pair_frac > 0 pero el pool no guarda las marcas de pares "
+                "apretados (`pair`): regenera el pool con preextract.py "
+                "--pair-px > 0, o entrena con --pair-frac 0")
+        marked = np.where(np.asarray(pair).reshape(-1) > 0)[0]
+        n_extra = int(round(pair_frac * n_pos))
+        extra = (rng.choice(marked, size=n_extra, replace=True)
+                 if n_extra > 0 and len(marked)
+                 else np.array([], dtype=np.int64))
+        idx = np.concatenate([np.arange(n_pos), extra, bg])
+    else:
+        idx = np.concatenate([np.arange(n_pos), bg])
     rng.shuffle(idx)
     return X[idx], y[idx]
 
@@ -203,10 +296,15 @@ class BinSequence:
 
     hard_frac = 0.0
     hard_px = HARD_PX
+    hard_band2 = 0
+    hard_frac2 = 0.0
+    hard_aniso = None
+    pair_frac = 0.0
 
     def __init__(self, ds_dir, ids, batch=65536, max_pts=65536, seed=0,
                  shuffle=True, bg_ratio=4.0, fast_split=True,
-                 hard_frac=0.0, hard_px=HARD_PX):
+                 hard_frac=0.0, hard_px=HARD_PX, hard_band2=0,
+                 hard_frac2=0.0, pair_frac=0.0, hard_aniso=None):
         import tensorflow as tf
         self.ds_dir = ds_dir
         self.ids = list(ids)
@@ -217,6 +315,10 @@ class BinSequence:
         self.bg_ratio = bg_ratio
         self.hard_frac = hard_frac
         self.hard_px = hard_px
+        self.hard_band2 = hard_band2
+        self.hard_frac2 = hard_frac2
+        self.hard_aniso = hard_aniso
+        self.pair_frac = pair_frac
         self.tf = tf
         # Por defecto solo se calculan las filas muestreadas (split_2d_rows,
         # bit-identico, ~60x menos trabajo); --slow-split usa la matriz
@@ -240,12 +342,23 @@ class BinSequence:
             with np.load(os.path.join(base, f"{sid}.npz")) as z:
                 total = int(z["X"].shape[0])
                 n_pos = int(z["n_pos"]) if "n_pos" in z else None
+                # `pair` se lee DENTRO del `with`: fuera, el NpzFile ya está
+                # cerrado y `z["pair"]` revienta con AttributeError
+                # ('NoneType' object has no attribute 'open'). Bug real: el run
+                # con `data/pre_elong_2b_pair` no arrancaba nunca, porque el
+                # fallo salía al calcular `len(seq)` antes de la 1ª época.
+                n_marked = (int((z["pair"] > 0).sum())
+                            if ("pair" in z and self.pair_frac > 0) else 0)
             if n_pos is None:  # formato antiguo: la muestra es el fichero
                 return max(1, total)
             # pool: lo que se entrena por época es el submuestreo, no el pool
             n_bg = min(total - n_pos, int(n_pos * self.bg_ratio),
                        self.max_pts - n_pos)
-            return max(1, n_pos + n_bg)
+            # el sobremuestreo de pares apretados añade filas al lote: cuentan
+            # en los steps (solo se mira si está encendido, el pool antiguo
+            # no lo nota)
+            extra = int(round(self.pair_frac * n_pos)) if n_marked else 0
+            return max(1, n_pos + extra + n_bg)
         L = np.memmap(os.path.join(self.ds_dir, "labels", f"{sid}.bin"),
                       dtype=np.uint8, mode="r", shape=SHAPE).astype(np.float32)
         npos = int((L.reshape(-1) > 0.5).sum())
@@ -271,17 +384,34 @@ class BinSequence:
         cambia. Con fast_split solo se construyen las filas de `idx`
         (split_2d_rows); la ruta lenta mantiene split_2d completo + X[idx].
         """
+        if self.pair_frac > 0:
+            raise ValueError(
+                "--pair-frac solo está soportado en modo pre-extraído: la ruta "
+                ".bin bajo demanda no tiene las marcas de pares apretados. Usa "
+                "--preextracted con un pool de preextract.py --pair-px > 0, o "
+                "--pair-frac 0")
         y = L.reshape(-1, 1)
         pos = np.where(y[:, 0] > 0.5)[0]
         n_bg = max(0, min(len(y) - len(pos), int(len(pos) * self.bg_ratio),
                           self.max_pts - len(pos)))
         neg = np.where(y[:, 0] < 0.5)[0]
-        if self.hard_frac > 0:
+        if self.hard_frac > 0 or self.hard_frac2 > 0:
             # ruta sin pre-extraccion: la distancia se calcula aquí mismo
-            d_flat = distance_to_positive(L).reshape(-1)
+            band2_mask = None
+            if self.hard_aniso is not None:
+                d_full, d1_full, d2_full = axis_distance_to_positive(L)
+                d_flat = d_full.reshape(-1)
+                band2_mask = aniso_band_mask(
+                    d1_full.reshape(-1)[neg], d2_full.reshape(-1)[neg],
+                    *self.hard_aniso)
+            else:
+                d_flat = distance_to_positive(L).reshape(-1)
             take_neg = neg[choose_background(neg, d_flat[neg], n_bg,
                                              self.hard_frac, self.hard_px,
-                                             self.rng)]
+                                             self.rng,
+                                             band2_px=self.hard_band2 or None,
+                                             band2_frac=self.hard_frac2,
+                                             band2_mask=band2_mask)]
         else:
             take_neg = self.rng.choice(neg, size=max(0, n_bg), replace=False)
         idx = np.concatenate([pos, take_neg])
@@ -301,11 +431,18 @@ class BinSequence:
             X, y = z["X"], z["y"]
             n_pos = int(z["n_pos"]) if "n_pos" in z else None
             d = z["d"] if "d" in z else None
+            d1 = z["d1"] if "d1" in z else None
+            d2 = z["d2"] if "d2" in z else None
+            pair = z["pair"] if "pair" in z else None
         if n_pos is None:  # formato antiguo: muestra fija, ya es final
             return np.ascontiguousarray(X), np.ascontiguousarray(y)
         Xs, ys = subsample_pool(X, y, n_pos, self.max_pts, self.bg_ratio,
                                 self.rng, d=d, hard_frac=self.hard_frac,
-                                hard_px=self.hard_px)
+                                hard_px=self.hard_px,
+                                band2_px=self.hard_band2 or None,
+                                band2_frac=self.hard_frac2,
+                                pair=pair, pair_frac=self.pair_frac,
+                                d1=d1, d2=d2, aniso=self.hard_aniso)
         return np.ascontiguousarray(Xs), np.ascontiguousarray(ys)
 
     def __iter__(self):
@@ -493,6 +630,30 @@ def main():
     ap.add_argument("--hard-px", type=int, default=HARD_PX,
                     help=f"radio en px del anillo considerado 'negativo duro' "
                          f"({HARD_PX})")
+    ap.add_argument("--hard-band2", type=int, default=0,
+                    help="radio exterior de la segunda banda de fondo, en px "
+                         "(0 = sin banda 2). El pool tiene que traer filas de "
+                         "esa banda: preextract.py --hard-band2")
+    ap.add_argument("--hard-frac2", type=float, default=0.0,
+                    help="fracción del fondo de cada época que sale de la banda "
+                         "2 (--hard-px < d <= --hard-band2) o de la banda "
+                         "anisótropa (--hard-aniso); 0 = apagada")
+    ap.add_argument("--hard-aniso", type=int, nargs=4, default=None,
+                    metavar=("F1LO", "F1HI", "F2LO", "F2HI"),
+                    help="banda de fondo anisótropa en px del pico, por eje: "
+                         "F1 (filas) en [F1LO, F1HI] y F2 (columnas) en "
+                         "[F2LO, F2HI]; p.ej. 3 10 1 3. Sustituye a "
+                         "--hard-band2 (excluyentes) y usa --hard-frac2. "
+                         "Requiere un pool de preextract.py --hard-aniso "
+                         "(con d1/d2)")
+    ap.add_argument("--pair-frac", type=float, default=0.0,
+                    help="sobremuestreo de PARES APRETADOS: cada época añade "
+                         "round(pair-frac x n_pos) filas extra sorteadas con "
+                         "reemplazo de las filas del pool marcadas como par "
+                         "(el npz las guarda en `pair`, escrito por "
+                         "preextract.py --pair-px > 0); 0 = apagado y "
+                         "comportamiento histórico byte a byte. Requiere modo "
+                         "--preextracted")
     ap.add_argument("--n-train", type=int, default=None,
                     help="usa solo los primeros N espectros de train (pruebas rapidas)")
     ap.add_argument("--n-val", type=int, default=None,
@@ -513,6 +674,25 @@ def main():
     ap.add_argument("--sync-every", type=int, default=5,
                     help="cada cuantas epocas copiar --scratch a --out (5)")
     args = ap.parse_args()
+
+    if args.pair_frac < 0:
+        ap.error(f"--pair-frac ({args.pair_frac}) no puede ser negativo")
+    if args.hard_aniso:
+        if args.hard_band2:
+            ap.error("--hard-aniso y --hard-band2 son excluyentes")
+        f1lo, f1hi, f2lo, f2hi = args.hard_aniso
+        if f1lo < 0 or f2lo < 0 or f1lo > f1hi or f2lo > f2hi:
+            ap.error(f"--hard-aniso {args.hard_aniso}: se espera "
+                     f"0 <= F1LO <= F1HI y 0 <= F2LO <= F2HI")
+        if args.hard_frac2 <= 0:
+            ap.error("--hard-aniso necesita --hard-frac2 > 0 (la fracción del "
+                     "fondo que sale de la banda anisótropa)")
+    if args.pair_frac > 0 and not args.preextracted:
+        raise SystemExit(
+            "ERROR: --pair-frac solo funciona en modo pre-extraído "
+            "(--preextracted): la ruta .bin bajo demanda no tiene las marcas de "
+            "pares apretados. Regenera el pool con scripts/preextract.py "
+            "--pair-px > 0, o entrena con --pair-frac 0.")
 
     import tensorflow as tf
     print("TF", tf.__version__, "GPUs:", tf.config.list_physical_devices("GPU"))
@@ -551,12 +731,20 @@ def main():
                             max_pts=args.max_pts, seed=args.seed, shuffle=True,
                             bg_ratio=args.bg_ratio,
                             fast_split=not args.slow_split,
-                            hard_frac=args.hard_frac, hard_px=args.hard_px)
+                            hard_frac=args.hard_frac, hard_px=args.hard_px,
+                            hard_band2=args.hard_band2,
+                            hard_frac2=args.hard_frac2,
+                            pair_frac=args.pair_frac,
+                            hard_aniso=args.hard_aniso)
     val_seq = BinSequence(ds_dir, val_ids, batch=args.batch,
                           max_pts=args.max_pts, seed=args.seed + 1, shuffle=False,
                           bg_ratio=args.bg_ratio,
                           fast_split=not args.slow_split,
-                          hard_frac=args.hard_frac, hard_px=args.hard_px)
+                          hard_frac=args.hard_frac, hard_px=args.hard_px,
+                          hard_band2=args.hard_band2,
+                          hard_frac2=args.hard_frac2,
+                          pair_frac=args.pair_frac,
+                          hard_aniso=args.hard_aniso)
     if not args.preextracted:
         used = ("por filas (split_2d_rows)" if train_seq.fast_split
                 else "completo (--slow-split)")
@@ -571,7 +759,8 @@ def main():
               f"(seed={man.get('seed')}, pool_k={man.get('pool_k')}, "
               f"bg_ratio/época={args.bg_ratio})")
         pool_ids = list(man.get("train", [])) + list(man.get("val", []))
-        sin_d = _pools_missing_d(args.data, pool_ids) if args.hard_frac > 0 else []
+        sin_d = (_pools_missing_d(args.data, pool_ids)
+                 if (args.hard_frac > 0 or args.hard_frac2 > 0) else [])
         if sin_d:
             raise SystemExit(
                 f"ERROR: {len(sin_d)}/{len(pool_ids)} pools de {args.data} no "
@@ -581,6 +770,30 @@ def main():
                 f"scripts/preextract.py --hard-frac {args.hard_frac} "
                 f"--hard-px {args.hard_px}, o entrena con --hard-frac 0 para "
                 f"usar el fondo uniforme de siempre.")
+        sin_axis = (_pools_missing_axis_d(args.data, pool_ids)
+                    if args.hard_aniso else [])
+        if sin_axis:
+            raise SystemExit(
+                f"ERROR: {len(sin_axis)}/{len(pool_ids)} pools de {args.data} "
+                f"no guardan las distancias por eje (`d1`/`d2`) "
+                f"(p.ej. {sin_axis[:3]}), así que no se puede construir la "
+                f"banda anisótropa: esos espectros entrenarían con fondo "
+                f"uniforme sin avisar. Regenera el pool con "
+                f"scripts/preextract.py --hard-aniso {args.hard_aniso[0]} "
+                f"{args.hard_aniso[1]} {args.hard_aniso[2]} "
+                f"{args.hard_aniso[3]} --hard-frac2 {args.hard_frac2}, o "
+                f"entrena sin --hard-aniso.")
+        sin_pair = (_pools_missing_pair(args.data, pool_ids)
+                    if args.pair_frac > 0 else [])
+        if sin_pair:
+            raise SystemExit(
+                f"ERROR: {len(sin_pair)}/{len(pool_ids)} pools de {args.data} "
+                f"no guardan las marcas de pares apretados (`pair`) "
+                f"(p.ej. {sin_pair[:3]}), así que no se puede sobremuestrear "
+                f"los pares: esos espectros entrenarían sin el sobremuestreo "
+                f"sin avisar. Regenera el pool con scripts/preextract.py "
+                f"--pair-px 6 (y el --pair-ratio que quieras), o entrena con "
+                f"--pair-frac 0.")
     os.makedirs(args.out, exist_ok=True)
     # --scratch: el entrenamiento escribe en local y se sincroniza a --out.
     ckpt_dir = args.scratch or args.out

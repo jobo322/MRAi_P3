@@ -113,6 +113,32 @@ Si hiciera falta más (paneo fluido a máxima resolución), el siguiente paso
 natural sería mover marching squares a un Web Worker — la extracción ya está
 aislada en `marchingSquares`/`sampledGrid`.
 
+## Modo B — dataset de entrenamiento (`--dataset`)
+
+```bash
+node scripts/plotting/view2d.mjs --dataset /Users/abolanos/git/cheminfo/spectrum-generator/dataset \
+    [--inference <dir>] [--port 8787]
+```
+
+Navega un dataset estilo spectrum-generator (`dataset.json` + `manifest.jsonl` +
+`spectra/<id>.bin` + `labels/<id>.bin` uint8): sidebar con los 1000 espectros
+(id, clase PG/PL/MIX, r, nº picos), mismos sliders de niveles (SD del manifest),
+raster, zoom por arrastre/rueda.
+
+En `viewer2d/dataset.html`:
+
+- **○ círculos azules sin relleno** = labels del dataset de entrenamiento
+  (píxeles donde `labels/<id>.bin == 1`, ground truth)
+- **× cruces rojas** = picos del peak picking post-inferencia, leídos de
+  `<id>.tab` (VARS `X1`/`Y1` = píxel del centro) en el directorio de inferencia:
+  por defecto `<dataset>/inference/`, o pásalo con `--inference <dir>`.
+  Si no existe, el viewer arranca igual (sin cruces) y la tabla muestra la
+  verdad del manifest.
+- Ambos overlays tienen toggle propio (`labels ○` / `inferencia ×`).
+
+API modo B: `GET /api/dataset`, `/api/manifest`, `/api/spectrum/:id`,
+`/api/labels/:id`, `/api/inference/:id` (0..N-1, validado contra el manifest).
+
 ## Artefactos de la conversión (`--out`, por defecto `/tmp/p51_view2d`)
 
 | Archivo | Contenido |
@@ -124,5 +150,8 @@ aislada en `marchingSquares`/`sampledGrid`.
 ## API del servidor
 
 - `GET /` → `viewer2d/index.html`
+- `GET /circles` → `viewer2d/index-circles.html` — copia modificada donde los
+  labels del dataset se dibujan como **círculos azules sin relleno** (el
+  original usa cruces rojas); el toggle se llama «labels»
 - `GET /api/meta` → `meta.json`
 - `GET /api/bin/spectrum|p3|f2ppm|f1hz` → bytes `float32` LE (whitelist, sin traversal)

@@ -67,7 +67,8 @@
         <select id="spacing"><option value="log">log</option><option value="linear">lineal</option></select>
       </label>
       <label><input id="lockLevels" type="checkbox"> fijar niveles</label>
-      <label><input id="showPeaks" type="checkbox" checked> picos</label>
+      <label><input id="showPeaks" type="checkbox" checked> picos ×</label>
+      <label><input id="showTruth" type="checkbox" checked> truth ○</label>
       <label><input id="underlay" type="checkbox" checked> raster</label>
       <button id="resetZoom">reset zoom</button>
     </div>
@@ -105,6 +106,7 @@ let vp = null;                 // last render transform (pixel ↔ grid)
 const zCache = new Map();      // key → Float32Array (z[row*nx + col])
 const sdCache = new Map();     // key → robust noise SD (sampled MAD)
 const peaks = { x: [], y: [], rows: [] };
+let truth = null;             // ground truth del dataset de entrenamiento (meta.truth)
 const SAMPLE_CACHE_LIMIT = 3;
 const sampleCache = new Map(); // crop key → {vals, nr, nc, sx, sy, subMin, subMax}
 
@@ -416,7 +418,7 @@ function render() {
     }
     ctx.stroke();
   });
-  // system peaks (red crosses), like the labels overlay of the original
+  // picos del peak picking post-inferencia: cruces rojas
   if ($('showPeaks').checked) {
     ctx.strokeStyle = 'rgba(220,38,38,.85)';
     ctx.lineWidth = 1.5;
@@ -428,6 +430,20 @@ function render() {
       const d = Math.max(3, Math.min(6, scaleY * 0.8));
       ctx.moveTo(X - d, Y - d); ctx.lineTo(X + d, Y + d);
       ctx.moveTo(X - d, Y + d); ctx.lineTo(X + d, Y - d);
+    }
+    ctx.stroke();
+  }
+  // ground truth del dataset de entrenamiento: círculos azules sin relleno
+  if (truth && $('showTruth').checked) {
+    ctx.strokeStyle = 'rgba(37, 99, 235, .9)';
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    for (let p = 0; p < truth.x.length; p++) {
+      const c = colOf(truth.x[p]), r = rowOf(truth.y[p]);
+      if (c < cx0 - 1 || c > cx1 || r < cy0 - 1 || r > cy1) continue;
+      const d = Math.max(2.5, Math.min(6, scaleY * 0.7));
+      ctx.moveTo(px(c) + d, py(r));   // evita segmento de conexión
+      ctx.arc(px(c), py(r), d, 0, 2 * Math.PI);
     }
     ctx.stroke();
   }
@@ -543,6 +559,7 @@ function bindEvents() {
   $('lockLevels').addEventListener('change', requestRender);
   $('underlay').addEventListener('change', requestRender);
   $('showPeaks').addEventListener('change', requestRender);
+  $('showTruth').addEventListener('change', requestRender);
   $('resetZoom').addEventListener('click', () => { view = fullView(); requestRender(); });
   $('peaksToggle').addEventListener('click', () => {
     peaksShown = !peaksShown;
@@ -603,6 +620,8 @@ let peaksShown = false;
     GRID.nx = META.shape[1];  // F2 columns
     GRID.ny = META.shape[0];  // F1 rows
     peaks.x = META.peaks.x; peaks.y = META.peaks.y; peaks.rows = META.peaks.rows || [];
+    truth = META.truth || null;
+    if (!truth) document.getElementById('showTruth').disabled = true;
     ITEMS.push({ key: 'spectrum', label: 'Spectrum', color: '#111' });
     if (META.p3) ITEMS.push({ key: 'p3', label: 'P3 probability', color: '#1f77b4' });
     for (const it of ITEMS) byKey.set(it.key, it);
@@ -611,7 +630,8 @@ let peaksShown = false;
     const f1Res = await fetch('/api/bin/f1hz');
     f1hz = new Float32Array(await f1Res.arrayBuffer());
     $('meta').textContent =
-      `${GRID.ny}×${GRID.nx} (x=F2 ppm, y=F1 Hz) · ${peaks.x.length} picos · ` +
+      `${GRID.ny}×${GRID.nx} (x=F2, y=F1) · ${peaks.x.length} picos inferencia ×` +
+      (truth ? ` · ${truth.x.length} truth ○` : ' · sin truth') + ' · ' +
       (META.source ? META.source.peakSource : '');
     bindEvents();
     buildSidebar();

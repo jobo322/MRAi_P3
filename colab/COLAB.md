@@ -149,6 +149,17 @@ daba P > 0,5 al 81 % de los vecinos inmediatos de un pico y la lista de picos
 salía ~7,7× más larga. Los pools anteriores a esto no guardan `d`, así que
 `train_model.py` se niega a arrancar con `--hard-frac > 0` y pide regenerarlos.
 
+La banda media puede ser isotrópica (`--hard-band2 6 --hard-frac2 0.25`) o
+**anisótropa** (`--hard-aniso F1LO F1HI F2LO F2HI --hard-frac2 0.25`, p.ej.
+`3 10 1 3`): esta última selecciona por eje (`d1` filas, `d2` columnas) y guarda
+`d1`/`d2` en el npz; `train_model.py --hard-aniso` la remuestrea cada época y
+falla claro si el pool no los trae. Medición y estado en
+`docs/ring_and_picking_metrics.md` §14.
+
+Lo medido de ese anillo —y el `msep` de la lista de picos, que es lo que limita la
+precisión una vez arreglado el fondo— está en `docs/ring_and_picking_metrics.md`
+(con la comparación frente al modelo base).
+
 ### Tamaño del pool (medido, float32 npz sin comprimir)
 
 | `--pool-k` | M pool | MB/espectro | 1000 espectros | Cobertura del fondo |
@@ -342,3 +353,34 @@ La calidad es equiparable al run viejo con ~60 % de las épocas de datos
 distintos, lo que dice bien del pipeline del pool — pero **hay que re-lanzar**
 con el arreglo de §8 para aprovechar las 210 épocas completas.
 
+
+---
+
+## 10. Ajuste recomendado de la cadena (medido 2026-10-17)
+
+El fondo de dos bandas (`--hard-band2 6 --hard-frac2 0.25`, pool con `--pool-k 24
+--hard-frac 0.55`) más la cadena afinada dan el mejor resultado medido hasta
+ahora sobre el dataset: **F1 0,836** (precisión 0,92, recall 0,76, 1690 picos
+para 2048 reales) frente a 0,615 del modelo anterior con la cadena de entonces.
+
+```bash
+# pool (una vez; ~7 GB) y fine-tune
+python scripts/preextract.py --dataset /content/dataset --ids /content/staged/manifest.json \
+  --out /content/pre_2b --seed 0 --pool-k 24 --hard-frac 0.55 --hard-px 2 \
+  --hard-band2 6 --hard-frac2 0.25 --fast
+
+python scripts/train_model.py --data /content/pre_2b --preextracted \
+  --init /content/Trained/Probability_2D/US/DNN_0 --lr 1e-4 --batch 65536 --bg-ratio 4 \
+  --hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25 \
+  --epochs 210 --patience 20 --scratch /content/out_2b --sync-every 5 --out $OUT
+
+# lista de picos
+python scripts/plotting/run_train_2d.py --id 1 --model $OUT/../out_elong_2b_savedmodel \
+  --spe-the 0.2 --pl-the 0.5 --msep 3
+```
+
+Por qué cada ajuste (con las mediciones y los experimentos descartados):
+`docs/ring_and_picking_metrics.md` §4, §9 y §10. Los valores por defecto de los
+scripts siguen siendo los antiguos (1 / 0,2 / 0,5) para no cambiar nada en
+silencio. La variante anisótropa (`--hard-aniso 3 10 1 3`) está implementada
+pero **todavía no reentrenada**; el A/B pendiente está en §14.

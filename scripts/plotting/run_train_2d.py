@@ -16,7 +16,13 @@ Steps (identical to folder 51):
      `StoP3.Production_2D` allocates the full (N,128,1) float64 context block,
      ~537 MB here).
   3. P3_2D noise/sign tail.
-  4. `P3toP5` (threshold) -> `P5toPeaks` -> `PeakstoTab`.
+  4. `P3toP5` (threshold, `msep`) -> `P5toPeaks` -> `PeakstoTab`.
+
+`--msep` is the minimum separation between peaks in the P3 chain. The model
+answers an elongated peak with a ridge along F1 (~4 rows at P > 0.5), so the
+historical `msep=1` emits 2-4 peaks per real peak; on 8 dataset spectra it cost
+1105 false positives out of 2505 peaks. `--msep 4-5` collapses the ridge
+(measured on the same 8 spectra: precision 0.56 -> 0.87-0.95, recall -0.02).
   5. Artifacts for the zero-dependency web viewer, plus a matplotlib PNG, plus
      a match report against the ground truth in `dataset/manifest.jsonl`.
 
@@ -61,12 +67,12 @@ DEFAULT_DATASET = "/Users/abolanos/git/cheminfo/spectrum-generator/dataset"
 # First existing wins. The elongated models are the point of this script; the
 # 2D-US base is the fallback so it still runs on a fresh checkout.
 MODEL_CANDIDATES = (
-    # "Trained/Probability_2D_Elongated/DNN_0_local_serving/DNN_0",
+    "Trained/Probability_2D_Elongated/DNN_0_local_serving/DNN_0",
     # "Trained/Probability_2D_Elongated/DNN_0_local_savedmodel",
     # "Trained/Probability_2D_Elongated/DNN_0_savedmodel",
     # "Trained/out_elong_continue/DNN_0",
     # "Trained/out_elong_savedmodel",
-    "Trained/Probability_2D/US/DNN_0",
+    # "Trained/Probability_2D/US/DNN_0",
 )
 SPEC_TYPE = "JRES"
 
@@ -85,6 +91,14 @@ def parse_args():
                     help="candidate mask threshold, |S| >= the * std(S) (0.5)")
     ap.add_argument("--pl-the", type=float, default=0.2,
                     help="P3toP5 probability threshold (0.2)")
+    ap.add_argument("--msep", type=int, nargs="+", default=[1],
+                    help="minimum separation between peaks, in points: "
+                         "`--msep 3` (both axes) or `--msep 3 1` (F1, F2). "
+                         "1 = the historical behaviour; the model answers with "
+                         "a ridge along F1, so 3-5 collapses the multiple "
+                         "maxima of one elongated peak. Measured on 8 dataset "
+                         "spectra: `3` -> F1 0.836, `3 1` -> F1 0.844 (the "
+                         "ridge is along F1; F2 keeps its pairs)")
     ap.add_argument("--spec-type", default=SPEC_TYPE)
     ap.add_argument("--row-block", type=int, default=8,
                     help="rows per inference block (8; memory knob)")
@@ -240,13 +254,13 @@ def p3_tail(P, S):
 # --------------------------------------------------------------------------- #
 # Step 3 - peak-list chain
 # --------------------------------------------------------------------------- #
-def run_chain(P3_path, ft2_path, out_dir, name, pl_the, spec_type):
+def run_chain(P3_path, ft2_path, out_dir, name, pl_the, spec_type, msep=1):
     import nmrglue as ng
     import MRAi_P3 as P3
 
     dic, P = ng.pipe.read(P3_path)
     P5_path = os.path.join(out_dir, f"{name}.P5")
-    P3.P3toP5.main(P3_path, ft2_path, "P", pl_the, "Pipe", out=P5_path)
+    P3.P3toP5.main(P3_path, ft2_path, "P", pl_the, "Pipe", out=P5_path, msep=msep)
     peaks_path = os.path.join(out_dir, f"{name}.peaks")
     P3.P5toPeaks.main(P5_path, ft2_path, spec_type, out=peaks_path)
     tab_path = os.path.join(out_dir, f"{name}.tab")
@@ -421,9 +435,96 @@ def match_report(gt_rows, gt_cols, det, match_px):
     }
 
 
+def shape_values(P, rows, cols, offsets=(3, 6), half=1):
+    """Decay de |P| alrededor de cada pico GT, por eje (F1 = filas, F2 = cols).
+
+    Para cada centro `(row, col)` se toma el máximo local en una ventana de
+    `2*half+1` (el GT cae a <=1 px del máximo real), se normaliza a 1 y se
+    promedian las dos muestras simétricas a `±d` px en cada eje:
+
+        f1_at_d = 0.5 * (|P[r-d, c]| + |P[r+d, c]|) / |P[r, c]|
+        f2_at_d = 0.5 * (|P[r, c-d]| + |P[r, c+d]|) / |P[r, c]|
+
+    Un pico en el borde no aporta la distancia que se sale de la imagen; un
+    centro con |P| = 0 se ignora. Devuelve arrays por clave (`f1_at_3`,
+    `f2_at_3`, `f1_over_f2_at_3`, ...) para poder agregar varios espectros.
+
+    Por qué: el match F1/precisión mide si el pico aparece, no cuánto peso deja
+    la P3 alrededor. Medido en 6 val, la P3 de producción conserva 5,9 % a ±3 px
+    en F1 (la S: 0,1 %) y 0,1 % en F2; esa cola F1 es la cresta que `msep`
+    colapsa. La métrica la hace visible en cada corrida.
+    """
+    P = np.asarray(P, dtype=float)
+    if P.ndim != 2:
+        raise ValueError(f"P debe ser 2D, no {P.shape}")
+    H, W = P.shape
+    out = {}
+    for d in offsets:
+        out[f"f1_at_{d}"] = []
+        out[f"f2_at_{d}"] = []
+        out[f"f1_over_f2_at_{d}"] = []
+    for r, c in zip(np.asarray(rows).ravel(), np.asarray(cols).ravel()):
+        r0, c0 = int(round(float(r))), int(round(float(c)))
+        if not (0 <= r0 < H and 0 <= c0 < W):
+            continue
+        r_lo, r_hi = max(0, r0 - half), min(H, r0 + half + 1)
+        c_lo, c_hi = max(0, c0 - half), min(W, c0 + half + 1)
+        win = np.abs(P[r_lo:r_hi, c_lo:c_hi])
+        if win.size == 0:
+            continue
+        dr, dc = np.unravel_index(int(np.argmax(win)), win.shape)
+        rr, cc = r_lo + int(dr), c_lo + int(dc)
+        centre = abs(P[rr, cc])
+        if centre <= 0:
+            continue
+        for d in offsets:
+            f1 = f2 = None
+            if rr - d >= 0 and rr + d < H:
+                f1 = 0.5 * (abs(P[rr - d, cc]) + abs(P[rr + d, cc])) / centre
+                out[f"f1_at_{d}"].append(f1)
+            if cc - d >= 0 and cc + d < W:
+                f2 = 0.5 * (abs(P[rr, cc - d]) + abs(P[rr, cc + d])) / centre
+                out[f"f2_at_{d}"].append(f2)
+            if f1 is not None and f2 is not None and f2 > 0:
+                out[f"f1_over_f2_at_{d}"].append(f1 / f2)
+    return {k: np.asarray(v, dtype=float) for k, v in out.items()}
+
+
+def shape_report(values):
+    """Medianas por distancia y relación F1/F2, a partir de `shape_values`."""
+    ds = sorted({int(k.split("_")[-1]) for k in values})
+    n = max((len(v) for v in values.values()), default=0)
+    rep = {"n": int(n)}
+    for d in ds:
+        def med(key):
+            a = np.asarray(values.get(key, []), dtype=float)
+            return float(np.median(a)) if len(a) else float("nan")
+        def ratio():
+            # `shape_values` ya deja la relación por pico; si el llamador solo
+            # pasó f1/f2 (p.ej. datos externos), se emparejan por prefijo.
+            key = f"f1_over_f2_at_{d}"
+            if key in values and len(values[key]):
+                return med(key)
+            a = np.asarray(values.get(f"f1_at_{d}", []), dtype=float)
+            b = np.asarray(values.get(f"f2_at_{d}", []), dtype=float)
+            n = min(len(a), len(b))
+            ok = b[:n] > 0
+            return float(np.median(a[:n][ok] / b[:n][ok])) if ok.any() else float("nan")
+        rep[f"at_{d}px"] = {
+            "f1": med(f"f1_at_{d}"),
+            "f2": med(f"f2_at_{d}"),
+            "f1_over_f2": ratio(),
+        }
+    return rep
+
+
 def main():
     args = parse_args()
     import tensorflow as tf
+    from MRAi_P3.P3toP5 import normalize_msep
+
+    # `--msep 3` -> 3, `--msep 3 1` -> [3, 1]  (argparse siempre da una lista)
+    msep = normalize_msep(args.msep)
 
     sid = args.id if args.id is not None else first_train_id(args.dataset)
     model_path = pick_model(args.model)
@@ -472,7 +573,8 @@ def main():
         print(f"[3/5] P3       -> {P3_path}")
 
         print("[4/5] peak chain")
-        run_chain(P3_path, ft2, out_dir, str(sid), args.pl_the, args.spec_type)
+        run_chain(P3_path, ft2, out_dir, str(sid), args.pl_the, args.spec_type,
+                  msep)
         det, det_meta = read_tab(tab, ft2)
         print(f"      detected {len(det)} peaks  -> {tab}")
 
@@ -510,6 +612,14 @@ def main():
     except ImportError:
         pass
 
+    shape = shape_report(shape_values(P, gt_rows, gt_cols))
+    s3, s6 = shape["at_3px"], shape["at_6px"]
+    print(f"      P3 shape (median decay, centre=1): "
+          f"F1/F2 @3px {s3['f1_over_f2']:.2f} "
+          f"(F1 {s3['f1']:.3f}, F2 {s3['f2']:.3f})  "
+          f"@6px {s6['f1_over_f2']:.2f} "
+          f"(F1 {s6['f1']:.3f}, F2 {s6['f2']:.3f})")
+
     if not args.no_view2d:
         vdir = dump_view2d(out_dir, S, P, gt_rows, gt_cols, det, det_meta)
         print(f"\nviewer artifacts -> {vdir}")
@@ -525,7 +635,8 @@ def main():
         json.dump({"id": sid, "class": cls, "r": r,
                    "model": os.path.relpath(model_path, REPO),
                    "spe_the": args.spe_the, "pl_the": args.pl_the,
-                   "match": rep}, fh, indent=1)
+                   "msep": msep, "match": rep, "p3_shape": shape},
+                  fh, indent=1)
     print("ALL DONE")
 
 

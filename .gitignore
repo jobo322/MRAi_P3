@@ -8,6 +8,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.python-version   # written by `pyenv local` (README, Apple Silicon Option A)
 
 # Packaging build leftovers (python -m build)
 build/

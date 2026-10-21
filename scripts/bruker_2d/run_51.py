@@ -15,7 +15,7 @@ Steps:
      the downstream header parsing. Verified byte-exact (maxdiff 0.0).
   2. Blocked Production_2D with Trained/Probability_2D/US/DNN_<axis>,
      candidate mask |S| >= SPE_THE * std(S), P3_2D noise/sign tail.
-  3. P3toP5 (PL_THE) -> P5toPeaks (SPEC_TYPE) -> PeakstoTab.
+  3. P3toP5 (PL_THE, MSEP) -> P5toPeaks (SPEC_TYPE) -> PeakstoTab.
 
 Usage:
   tflow/bin/python scripts/bruker_2d/run_51.py
@@ -41,6 +41,7 @@ NAME = '51'
 D2D = os.path.join(REPO, 'Trained/Probability_2D/US')
 SPE_THE = 0.5
 PL_THE = 0.2
+MSEP = 1
 SPEC_TYPE = 'JRES'
 ROW_BLOCK = 8
 AXIS = 0
@@ -54,6 +55,13 @@ def parse_args():
     ap.add_argument('--model-dir', default=D2D, help='Trained/Probability_2D dir')
     ap.add_argument('--spe-the', type=float, default=SPE_THE)
     ap.add_argument('--pl-the', type=float, default=PL_THE)
+    ap.add_argument('--msep', type=int, nargs='+', default=[MSEP],
+                    help='Minimum separation between peaks in points: '
+                         '`--msep 3` (both axes) or `--msep 3 1` (F1, F2). '
+                         '1 = the historical behaviour. On elongated 2D peaks '
+                         'the model answers with a ridge along F1 and 1 emits '
+                         '2-4 peaks per real peak; 3-5 collapses it, and 3 1 '
+                         'collapses the ridge without eating the F2 pairs.')
     ap.add_argument('--spec-type', default=SPEC_TYPE)
     ap.add_argument('--row-block', type=int, default=ROW_BLOCK)
     ap.add_argument('--axis', type=int, default=AXIS)
@@ -134,7 +142,9 @@ def main():
 
     # ---- peak list chain ----
     P5_PATH = os.path.join(OUT, f'{args.name}.P5')
-    P3.P3toP5.main(P3_PATH, FT2, 'P', args.pl_the, 'Pipe', out=P5_PATH)
+    # `--msep 3` -> 3, `--msep 3 1` -> [3, 1]  (argparse siempre da una lista)
+    P3.P3toP5.main(P3_PATH, FT2, 'P', args.pl_the, 'Pipe', out=P5_PATH,
+                   msep=P3.P3toP5.normalize_msep(args.msep))
     print('wrote', P5_PATH, flush=True)
     PEAKS_PATH = os.path.join(OUT, f'{args.name}.peaks')
     P3.P5toPeaks.main(P5_PATH, FT2, args.spec_type, out=PEAKS_PATH)
