@@ -15,6 +15,9 @@ background pool once, then run the complete 210-epoch fine-tune.
   the `msep` knob, and the comparison with the base model),
   `docs/session_checkpoint_2026-10-14.md` (Phase 1 state), and
   `odd/tasks/PLAN_split_rows.md` (measurements behind the row-wise split).
+* **Pinned runbook:** `docs/runs/2026-10-21-aniso-60e9ce4.md` — the exact
+  anisotropic A/B commands and flags at commit `60e9ce4`. Use it when defaults
+  or options may have changed since this guide was written.
 * **Executable version:** `docs/local_training.ipynb` — the same steps as a
   runnable Jupyter notebook, with each stage checking its own result. It finds
   a Python that can `import tensorflow` by itself, so it works even from the
