@@ -182,6 +182,8 @@ jupyter notebook
 
 To retrain/fine-tune the 2D-US peak-probability model on your own machine — background-pool pre-extraction (`scripts/preextract.py`) followed by the full 210-epoch run (`scripts/train_model.py`) — follow the validated step-by-step guide in [docs/local_training.md](docs/local_training.md). The same guide as a runnable Jupyter notebook is [docs/local_training.ipynb](docs/local_training.ipynb). The same pipeline on a Colab GPU is documented in [colab/COLAB.md](colab/COLAB.md).
 
+To run the same steps as HTCondor jobs on the NMRbox pool (submit from a VM, no need to keep your laptop on), see [htcondor/README.md](htcondor/README.md).
+
 **Prerequisites:** any Python 3.10–3.13 environment with TensorFlow ≥ 2.15 (arm64-native) — the `mrai_p3` environment created in the *Installation* section above qualifies; [docs/local_training.md](docs/local_training.md) §1 shows how to build a dedicated one if you prefer. The training scripts need only TensorFlow + NumPy and this repository checkout (the wheel is not required for training).
 
 **Check that you are ready to train** — run from the repository folder:

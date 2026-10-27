@@ -808,7 +808,10 @@ def main():
         tf.keras.callbacks.ModelCheckpoint(
             os.path.join(ckpt_dir, "ckpt.keras"), monitor="val_loss",
             save_best_only=True),
-        tf.keras.callbacks.CSVLogger(os.path.join(ckpt_dir, "training.log")),
+        # append=resume: al reanudar, run_train.sh siembra el log con la
+        # historia previa y Keras tiene que seguir escribiendo al final.
+        tf.keras.callbacks.CSVLogger(os.path.join(ckpt_dir, "training.log"),
+                                     append=bool(args.resume)),
     ]
     if args.scratch:
         # Despues de ModelCheckpoint/CSVLogger para que los ficheros existan.
