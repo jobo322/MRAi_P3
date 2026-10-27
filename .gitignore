@@ -21,8 +21,8 @@ Trained copy/
 docs/*.pdf
 
 # HTCondor job logs (submit files are versioned, logs are not)
-jobs/logs/*
-!jobs/logs/.gitkeep
+htcondor/logs/*
+!htcondor/logs/.gitkeep
 
 # Google Drive's duplicate-name download marker, e.g.
 # out_elong-20261015T162906Z-1-001.zip. When the same run is also present

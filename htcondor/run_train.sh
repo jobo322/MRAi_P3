@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # HTCondor entry point for mrai_p3 training on NMRbox.
 #
+# Lo llama htcondor/train.sub (arguments = RUN_NAME POOL [extra...]); tambien
+# se puede correr a mano. La geometria de negativos duros sale del manifest del
+# pool, nunca de flags escritos a mano.
+#
 # Usage:
 #   run_train.sh RUN_NAME [POOL] [extra train_model.py args...]
 #
@@ -18,9 +22,9 @@
 #   MRAI_PAIR_FRAC  value for --pair-frac (default 0; needs a pool with `pair`)
 #   MRAI_DRY_RUN  1 = print the command and exit without training
 #
-# The hard-negative geometry (ring / band / aniso rectangle) is read from the
-# pool's manifest.json instead of being passed by hand: the pool and the
-# training must use the same geometry or the A/B is invalid.
+# The hard-negative geometry (ring / band / aniso rectangle / axis quota) is
+# read from the pool's manifest.json instead of being passed by hand: the pool
+# and the training must use the same geometry or the A/B is invalid.
 set -euo pipefail
 
 if [[ $# -lt 1 ]]; then
@@ -117,7 +121,9 @@ if [[ "$STAGE" != "0" && -n "${_CONDOR_SCRATCH_DIR:-}" ]]; then
 fi
 
 # --- geometry, straight from the pool manifest ------------------------------
-read -r HARD_FRAC HARD_PX HARD_FRAC2 HARD_BAND2 HARD_ANISO < <(
+# El cupo del eje va ANTES de HARD_ANISO: la última variable de `read` absorbe
+# el resto de la línea (la geometría anisótropa son 4 ints).
+read -r HARD_FRAC HARD_PX HARD_FRAC2 HARD_BAND2 HARD_AXIS_FRAC HARD_ANISO < <(
   "$PY" - "$SRC_POOL/manifest.json" <<'PY'
 import json
 import sys
@@ -129,13 +135,14 @@ print(
     m.get("hard_px", 2),
     m.get("hard_frac2", 0),
     m.get("hard_band2", 0),
+    m.get("hard_axis_frac", 0),
     " ".join(str(x) for x in aniso) if aniso else "-",
 )
 PY
 )
 
 if [[ -z "$HARD_FRAC" || -z "$HARD_PX" || -z "$HARD_FRAC2" || \
-      -z "$HARD_BAND2" || -z "$HARD_ANISO" ]]; then
+      -z "$HARD_BAND2" || -z "$HARD_AXIS_FRAC" || -z "$HARD_ANISO" ]]; then
   echo "ERROR: no pude leer la geometría de $SRC_POOL/manifest.json" >&2
   exit 1
 fi
@@ -146,7 +153,7 @@ if [[ "$HARD_ANISO" != "-" ]] && is_zero "$HARD_FRAC2"; then
 fi
 # --- output dir, resume and .done marker ------------------------------------
 OUT="$REPO/Trained/$RUN_NAME"
-mkdir -p "$OUT" "$REPO/jobs/logs"
+mkdir -p "$OUT" "$REPO/htcondor/logs"
 
 if [[ -f "$OUT/.done" ]]; then
   echo "ERROR: $OUT ya terminó (tiene .done). Elegí otro RUN_NAME." >&2
@@ -166,6 +173,12 @@ if ! is_zero "$HARD_FRAC2"; then
   elif [[ "$HARD_BAND2" != "0" ]]; then
     ARGS+=(--hard-band2 "$HARD_BAND2" --hard-frac2 "$HARD_FRAC2")
   fi
+fi
+# Cupo del eje F1 dentro de la banda (0 = sin cupo). Sale del manifest para que
+# el entrenamiento no pueda pedir una relación eje:diagonal distinta a la que
+# tiene el pool: train_model.py corta si no coinciden.
+if ! is_zero "$HARD_AXIS_FRAC"; then
+  ARGS+=(--hard-axis-frac "$HARD_AXIS_FRAC")
 fi
 if [[ "${MRAI_PAIR_FRAC:-0}" != "0" ]]; then
   ARGS+=(--pair-frac "$MRAI_PAIR_FRAC")

@@ -26,7 +26,12 @@ esac
 [ -f "$path" ] || { echo "no existe el submit file: $path" >&2; exit 2; }
 
 run=""
-ov_text=""
+# Los overrides van a un archivo temporal, no a `awk -v`: el awk de BSD (macOS)
+# rechaza un valor con saltos de línea ("newline in string") y submit.sh se usa
+# tanto desde la VM de Linux como desde la Mac. Leerlos con `getline` funciona
+# en los dos.
+ov_file=$(mktemp "${TMPDIR:-/tmp}/mrai_overrides.XXXXXX")
+trap 'rm -f "$ov_file"' EXIT
 for kv in "$@"; do
   case $kv in
     *=*) ;;
@@ -35,7 +40,7 @@ for kv in "$@"; do
   key=${kv%%=*}
   val=${kv#*=}
   [ "$key" = "RunName" ] && run=$val
-  ov_text+="$key = $val"$'\n'
+  printf '%s = %s\n' "$key" "$val" >> "$ov_file"
 done
 
 if [ -z "$run" ]; then
@@ -56,8 +61,8 @@ fi
 mkdir -p "$here/runs" "$here/logs"
 out=$here/runs/$run.sub
 
-awk -v ov="$ov_text" '
-  BEGIN { n = split(ov, lines, "\n") }
+awk -v ovf="$ov_file" '
+  BEGIN { n = 0; while ((getline line < ovf) > 0) lines[++n] = line; close(ovf) }
   /^[[:space:]]*queue([[:space:]]|$)/ {
     for (i = 1; i <= n; i++) if (lines[i] != "") print lines[i]
   }

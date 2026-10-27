@@ -164,7 +164,9 @@ Reglas prácticas del pool (del tutorial):
 
 - jobs de **menos de 8 h**; el entrenamiento de 210 epochs entra (~1–1.5 h);
 - preferir **1 core por job** antes que `request_cpus = 48` (los jobs multicore
-  esperan a que se vacíe la cola de jobs de 1 core);
+  esperan a que se vacíe la cola de jobs de 1 core). El entrenamiento es la
+  excepción medida: usa 8 threads porque TF rinde mucho mejor así
+  (ver *Recursos y política*);
 - `request_memory` realista: pedir de más baja tu prioridad;
 - no pedir `transfer_*`: todo el pool ve `/home`, y así no se copian GB de pool.
 
@@ -180,41 +182,69 @@ source ~/htcondor-portable/activate.sh   # cliente portátil (§1.1); con el de 
 
 1. **Código y datos al día.** El job corre el código que está en este
    checkout: si tocaste `scripts/`, commiteá o al menos guardá los cambios.
-2. **Nombre de corrida nuevo.** `RunName` nombra logs, `--out` y el pool.
-   No reutilices uno: `CSVLogger` y `ModelCheckpoint` **sobrescriben**
+2. **Nombre de corrida nuevo.** `RunName` nombra los logs y el out
+   (`Trained/<RunName>`); el pool es aparte, con `Pool=<dir bajo data/>`.
+   No reutilices un `RunName`: `CSVLogger` y `ModelCheckpoint` **sobrescriben**
    `training.log` y `ckpt.keras`.
-3. **Verificá el insumo.** Tiene que existir `data/<pool>/manifest.json` y el
-   `Extra` de entrenamiento tiene que repetir las bandas del pool. Los que hay
-   hoy en esta VM:
+3. **Verificá el insumo.** Tiene que existir `data/<pool>/manifest.json`. La
+   geometría de negativos duros (anillo, banda y cupo del eje) **no se escribe
+   a mano**: `htcondor/run_train.sh` la lee del manifest del pool. Los pools que
+   hay hoy en esta VM:
 
-   | pool | flags de `Extra` |
+   | pool | banda |
    |---|---|
-   | `data/pre_aniso_f2lo0_454510` | `--hard-frac 0.45 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.45` |
-   | `data/pre_aniso_f2lo0_552520` | `--hard-frac 0.55 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.25` |
+   | `data/pre_aniso_f2lo0_454510` | `3-10 × 0-3`, `hard_frac 0.45 / frac2 0.45` |
+   | `data/pre_aniso_f2lo0_552520` | `3-10 × 0-3`, `hard_frac 0.55 / frac2 0.25` |
    | `data/pre_aniso_f2lo0_306010` | **incompleto** (523 npz, sin manifest) → no usar |
+
+   Para inspeccionar (o para pasarle los flags a `preextract.py`, o a
+   `train_model.py` a mano) está el helper, que es la única fuente de verdad de
+   esa geometría:
+
+   ```bash
+   scripts/pool_flags.sh data/pre_aniso_f2lo0_454510
+   # --hard-frac 0.45 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.45
+   scripts/pool_flags.sh data/pre_aniso_f2lo0_3268_f2hi4_a25
+   # --hard-frac 0.32 --hard-px 2 --hard-aniso 3 8 0 4 --hard-frac2 0.68 --hard-axis-frac 0.25
+   ```
+
+   Si el pool tiene cupo del eje (`hard_axis_frac` en el manifest) el helper
+   agrega `--hard-axis-frac`, y `train_model.py` corta si el entrenamiento pide
+   otra relación eje:diagonal que la del pool: no se puede entrenar mal en
+   silencio.
 
 4. **Enviá** con el wrapper (deja copia del `.sub` final en `htcondor/runs/`):
 
-   Entrenamiento (los defaults de `train.sub` ya son la receta de 454510):
+   Entrenamiento. `Pool` es el directorio bajo `data/`; `RunName` nombra el run y
+   el out (`Trained/<RunName>`):
 
    ```bash
-   htcondor/submit.sh train.sub RunName=2026-10-26_aniso
+   htcondor/submit.sh train.sub RunName=out_nmrbox_454510 Pool=pre_aniso_f2lo0_454510
    ```
 
-   Variante sobre el otro pool:
+   Y un brazo del cupo del eje (banda 3–8 × 0–4, cupo 1:3):
 
    ```bash
-   htcondor/submit.sh train.sub RunName=2026-10-26_552520 \
-       Data=data/pre_aniso_f2lo0_552520 \
-       Extra="--hard-frac 0.55 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.25"
+   htcondor/submit.sh train.sub RunName=out_aniso_a25 \
+       Pool=pre_aniso_f2lo0_3268_f2hi4_a25
    ```
 
-   Pre-extracción (si cambiaron los flags del pool):
+   `Extra` queda para flags sueltos de `train_model.py` (por ejemplo
+   `Extra="--bg-ratio 6"`); la geometría **no** va ahí.
+
+   Pre-extracción (acá sí hay que escribir la geometría: el manifest todavía no
+   existe). El cupo del eje se pide con `--hard-axis-frac`, que exige `F2LO = 0`
+   y `--hard-frac2 > 0`:
 
    ```bash
    htcondor/submit.sh preextract.sub RunName=2b \
        Pool=data/pre_elong_2b PoolK=24 \
        Extra="--pool-k 24 --hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25"
+
+   # pool con cupo del eje (1:3 dentro de la banda 3-8 x 0-4):
+   htcondor/submit.sh preextract.sub RunName=aniso_a25 \
+       Pool=data/pre_aniso_f2lo0_3268_f2hi4_a25 PoolK=24 \
+       Extra="--pool-k 24 --hard-frac 0.32 --hard-px 2 --hard-aniso 3 8 0 4 --hard-frac2 0.68 --hard-axis-frac 0.25"
    ```
 
    Inferencia por lote:
@@ -236,8 +266,46 @@ source ~/htcondor-portable/activate.sh   # cliente portátil (§1.1); con el de 
    nada que transferir.
 
 Sin el wrapper también se puede (`cd ~/git/mrai_p3 && condor_submit
-htcondor/train.sub`), pero entonces el `RunName` queda vacío y los paths
-salen mal: el wrapper es el camino recomendado.
+htcondor/train.sub`), pero entonces el `RunName` queda en el default y los paths
+salen de ahí: el wrapper es el camino recomendado.
+
+### Qué garantiza `run_train.sh`
+
+- **Intérprete**: falla al arrancar si `MRAI_PYTHON` no es ejecutable, en vez de
+  morir más tarde en `import tensorflow`.
+- **Geometría del pool**: `--hard-frac`, `--hard-px`, `--hard-frac2`,
+  `--hard-aniso` / `--hard-band2` y el cupo del eje (`--hard-axis-frac`, 0 =
+  apagado) salen del `manifest.json` del pool. No se pueden desincronizar pool y
+  training.
+- **Reanudación**: si `Trained/<RunName>/ckpt.keras` existe, agrega `--resume`.
+  Si existe `.done`, se niega a correr (elegí otro `RunName`). Al reanudar,
+  `training.log` se siembra con la historia previa y `CSVLogger` appendea
+  (`append=args.resume`), así que no se pierden las épocas anteriores.
+- **Checkpoints**: `--scratch` apunta al disco local del nodo y sincroniza a
+  `Trained/<RunName>` cada 5 épocas. Si HTCondor evicta el job, el reenvío
+  reanuda.
+- **Staging**: copia el pool (7 GB) a `$_CONDOR_SCRATCH_DIR` si hay al menos
+  1 GB extra libre; si no, lee desde `$HOME`. Se apaga con `MRAI_STAGE=0`. Si
+  `_CONDOR_SCRATCH_DIR` no estuviera definido, usa `/tmp`.
+- **`TMPDIR`**: `getenv = True` hereda el `TMPDIR` de la VM de submit (que no
+  existe en los workers). Si el heredado no es escribible, el wrapper usa el
+  scratch del job.
+
+### Recursos y política
+
+- `Threads = 8` en `train.sub` alimenta a la vez `request_cpus` y
+  `MRAI_THREADS`: un solo valor, sin desincronización. El tutorial recomienda
+  jobs de 1 core (los multicore quedan detrás de la cola single-core), pero TF
+  rinde mejor con varios hilos: es un trade-off consciente.
+- `request_memory = 8GB`. Si ves `Abnormal termination (signal 9)` en el `.log`,
+  subila. Medí con `condorize --timeout 120 -- python ...`.
+- `request_disk = 16GB`: el pool stageado son 7 GB + checkpoints.
+- `+Production = True` es necesario: `~/vtflow` **no** es autocontenido
+  (`pyvenv.cfg: home = /usr/bin`, stdlib del sistema).
+- 48 h máximo por job; checkpointing obligatorio arriba de 48 h (acá ya lo hay
+  cada 5 épocas).
+- Jobs grandes van **solo** por HTCondor, no por VNC/SSH.
+- Máximo 3 conexiones VNC/SSH simultáneas a las VMs.
 
 ---
 
@@ -270,11 +338,13 @@ Si reenviás después de cancelar, usá otro `RunName`.
 | Etapa | Salida |
 |---|---|
 | `preextract.py` | `Pool/manifest.json`, `<id>.npz`, `preextract.log` |
-| `train_model.py` | `Out/ckpt.keras`, `training.log`, `history.*`, `Out_savedmodel/` |
+| `train_model.py` (vía `run_train.sh`) | `Trained/<RunName>/ckpt.keras`, `training.log`, `history.*` y, al terminar, `Trained/<RunName>_savedmodel/` |
 | `infer_batch.py` | `Out/<id>.tab`, `<id>/view2d/p3.bin`, `batch_report.json` |
 
+Los logs de HTCondor van a `htcondor/logs/<RunName>.<Cluster>.<Process>.{log,out,err}`.
+
 El modelo que consume la cadena de picking es el **SavedModel**
-(`<Out>_savedmodel/`), no `ckpt.keras`.
+(`Trained/<RunName>_savedmodel/`), no `ckpt.keras`.
 
 ---
 
@@ -284,7 +354,7 @@ El modelo que consume la cadena de picking es el **SavedModel**
   cortada usar `--resume`, nunca `--init`.
 - **Nada en `/scratch`**: los workers no lo ven. Todo en `$HOME`.
 - **Memoria**: el pool con `--pool-k 24` pesa ~7 GB en disco; el job lo lee por
-  archivo, así que 16 GB de `request_memory` alcanzan. Si ves `Abnormal
+  archivo, así que los 8 GB de `request_memory` alcanzan. Si ves `Abnormal
   termination (signal 9)` en el `.log`, subí `request_memory`.
 - **`+Production = True`** es lo recomendado: el venv **no** es autocontenido
   (el stdlib sale de `/usr/lib/python3.12`), así que conviene que el worker sea
@@ -297,9 +367,9 @@ El modelo que consume la cadena de picking es el **SavedModel**
   # requirements = GPUs_Capability >= 8    # opcional: excluye T4/V100
   ```
   Hoy esta VM no tiene GPU (`nvidia-smi` no existe) y el modelo entrena en CPU.
-- **Un entrenamiento = un job de 1 core.** Condor no acelera una corrida
-  sola; sirve para lanzar varias en paralelo (A/B de `--hard-aniso`,
-  `--pair-frac`, etc.) y para no ocupar tu VM.
+- **Un entrenamiento = un job** (8 threads, ver *Recursos y política*). Condor
+  no acelera una corrida sola; sirve para lanzar varias en paralelo (A/B de
+  `--hard-aniso`, del cupo del eje, `--pair-frac`, etc.) y para no ocupar tu VM.
 
 ---
 
@@ -310,19 +380,16 @@ mismo, sin Condor, con las **mismas flags** del `.sub`:
 
 ```bash
 cd ~/git/mrai_p3
-mkdir -p htcondor/logs
 RUN=$(date +%Y%m%d_%H%M)
-nohup ~/vtflow/bin/python scripts/train_model.py \
-  --data data/pre_aniso_f2lo0_454510 --preextracted \
-  --init Trained/Probability_2D/US/DNN_0 \
-  --lr 1e-4 --batch 65536 --bg-ratio 4 \
-  --hard-frac 0.45 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.45 \
-  --epochs 210 --patience 20 \
-  --out "Trained/out_$RUN" \
+# el mismo wrapper que usa train.sub: lee la geometria del manifest del pool
+nohup ./htcondor/run_train.sh "out_$RUN" pre_aniso_f2lo0_454510 \
   > "htcondor/logs/$RUN.out" 2>&1 &
 
 tail -f "htcondor/logs/$RUN.out"
 ```
+
+Si preferís el comando pelado (sin wrapper), los flags de negativos duros salen
+del pool con `scripts/pool_flags.sh data/<pool>` en vez de escribirlos a mano.
 
 Es exactamente lo que el tutorial desaconseja para el pool compartido (mejor
 1 core por job y dejar que Condor reparta), pero para una corrida única de

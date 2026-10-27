@@ -1,45 +1,64 @@
 # ---------------------------------------------------------------------------
-# Fase 2 - fine-tune del modelo 2D-US elongado (1 core, ~1-1.5 h / 210 epocas)
+# Fase 2 - fine-tune del modelo 2D-US elongado (~1-1.5 h / 210 epocas)
 #
-# Enviar SIEMPRE con el wrapper, que deja copia en htcondor/runs/:
-#   htcondor/submit.sh train.sub RunName=2026-10-26_aniso
+# Enviar SIEMPRE con el wrapper de submit, que deja copia en htcondor/runs/:
+#   htcondor/submit.sh train.sub RunName=out_aniso_a25 Pool=pre_aniso_f2lo0_3268_f2hi4_a25
 #
-# Los flags de bandas (Extra) tienen que ser los del pool: miralos en
-# data/<pool>/manifest.json. Defaults de abajo = receta de
-# data/pre_aniso_f2lo0_454510 (hard_frac 0.45, aniso 3 10 0 3, frac2 0.45).
+# La geometria de negativos duros (anillo, banda anisotropa y cupo del eje) NO
+# se escribe aca: la lee htcondor/run_train.sh del manifest.json del pool, asi
+# que pool y entrenamiento no pueden desincronizarse. Si necesitas agregar flags
+# sueltos a train_model.py, van en Extra (se agregan al final y pisan defaults).
 #
-# `Out` se deriva de RunName: cada envio escribe en un directorio nuevo.
-# (CSVLogger y ModelCheckpoint SOBRESCRIBEN si reusas el mismo --out.)
+# `RunName` es el nombre del run y del out: cada envio escribe en Trained/<RunName>
+# (CSVLogger y ModelCheckpoint SOBRESCRIBEN si reusas el mismo RunName).
 # ---------------------------------------------------------------------------
 
-universe      = vanilla
-executable    = /home/nmrbox/0070/abolanos/vtflow/bin/python
+universe = vanilla
 
-arguments     = scripts/train_model.py --data $(Data) --preextracted --init $(Init) --lr $(Lr) --batch $(Batch) --bg-ratio $(BgRatio) --epochs $(Epochs) --patience $(Patience) $(Extra) --out $(Out)
+USERDIR = /home/nmrbox/0070/abolanos/git/mrai_p3
 
-# --- valores por defecto (el wrapper puede pisar cualquiera antes de queue) ---
-Data          = data/pre_aniso_f2lo0_454510
-Init          = Trained/Probability_2D/US/DNN_0
-Lr            = 1e-4
-Batch         = 65536
-BgRatio       = 4
-Epochs        = 210
-Patience      = 20
-Extra         = --hard-frac 0.45 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.45
-Out           = Trained/out_$(RunName)
+executable = $(USERDIR)/htcondor/run_train.sh
+arguments  = $(RunName) $(Pool) $(Extra)
 
-# --- entorno / ejecucion ----------------------------------------------------
+# --- valores por defecto (el wrapper de submit puede pisar cualquiera) -------
+RunName = out_nmrbox_454510
+Pool    = pre_aniso_f2lo0_454510
+Extra   =
+
+# Nombres por corrida (RunName), como preextract.sub e infer.sub: con varios
+# bloques `queue` en un mismo submit cada job escribe su propio log.
+log    = $(USERDIR)/htcondor/logs/$(RunName).$(Cluster).$(Process).log
+output = $(USERDIR)/htcondor/logs/$(RunName).$(Cluster).$(Process).out
+error  = $(USERDIR)/htcondor/logs/$(RunName).$(Cluster).$(Process).err
+
+# Shared filesystem: the job reads/writes your home directly, no staging by
+# HTCondor. run_train.sh still copies the pool to the node-local execute dir.
 getenv                = True
 should_transfer_files = NO
 transfer_executable   = FALSE
 
-request_cpus   = 1
-request_memory = 16GB
-request_disk   = 5GB
-+Production    = True
+# Un solo valor para CPUs y threads: no se pueden desincronizar.
+# No pidas 48: los jobs multicore quedan detras de la cola single-core.
+Threads = 8
 
-log           = htcondor/logs/$(RunName).$(Cluster).log
-output        = htcondor/logs/$(RunName).$(Cluster).out
-error         = htcondor/logs/$(RunName).$(Cluster).err
+environment = "MRAI_THREADS=$(Threads)"
+
+# getenv=True propaga MRAI_PYTHON / MRAI_STAGE / MRAI_INIT del shell que hace
+# condor_submit; exportalos ahi si queres otro interprete o apagar el staging.
+request_cpus   = $(Threads)
+request_memory = 8GB
+request_disk   = 16GB
+
++Production = True
+
+# --- another run in the same submission -------------------------------------
+# arguments = out_aniso_a20 pre_aniso_f2lo0_3268_f2hi4_a20
+# queue
 
 queue
+
+# --- GPU variant (A100/H100/V100 are HTCondor-only) -------------------------
+# Check first: condor_status -af Name GPUs_Capability
+#   request_gpus = 1
+#   requirements = (GPUs_Capability >= 8)
+# and verify that the node's CUDA matches your TensorFlow build.
