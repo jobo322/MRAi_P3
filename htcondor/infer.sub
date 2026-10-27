@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Inferencia por lote (100 espectros ~3 min). Un job por lote/split.
+#
+#   htcondor/submit.sh infer.sub RunName=val100_split=val N=100 Split=val \
+#       Model=Trained/out_elong_2b_savedmodel
+#
+# La salida queda en $HOME (FS compartido), no hay nada que transferir.
+# ---------------------------------------------------------------------------
+
+universe      = vanilla
+executable    = /home/nmrbox/0070/abolanos/vtflow/bin/python
+
+arguments     = scripts/plotting/infer_batch.py --n $(N) --split $(Split) --model $(Model) --out $(Out) $(Extra)
+
+N             = 100
+Split         = val
+Model         = Trained/out_elong_2b_savedmodel
+Out           = Trained/infer_$(RunName)
+# La cadena medida (equivale a los defaults actuales, pero explicita):
+Extra         = --spe-the 0.2 --pl-the 0.6 --msep 3 1
+
+getenv                = True
+should_transfer_files = NO
+transfer_executable   = FALSE
+
+request_cpus   = 1
+request_memory = 12GB
+request_disk   = 5GB
++Production    = True
+
+log           = htcondor/logs/$(RunName).$(Cluster).log
+output        = htcondor/logs/$(RunName).$(Cluster).out
+error         = htcondor/logs/$(RunName).$(Cluster).err
+
+queue

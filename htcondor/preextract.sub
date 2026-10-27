@@ -1,0 +1,37 @@
+# ---------------------------------------------------------------------------
+# Pre-extraccion del pool de fondo (una vez por combinacion de flags del pool)
+#
+#   htcondor/submit.sh preextract.sub RunName=2b \
+#       Pool=data/pre_elong_2b \
+#       Extra="--pool-k 24 --hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25"
+#
+# Ojo: --pool-k debe ser > el --bg-ratio que uses al entrenar (10 > 4).
+# ---------------------------------------------------------------------------
+
+universe      = vanilla
+executable    = /home/nmrbox/0070/abolanos/vtflow/bin/python
+
+arguments     = scripts/preextract.py --dataset $(Dataset) --ids $(Ids) --out $(Pool) --seed $(Seed) --pool-k $(PoolK) $(Extra)
+
+Dataset       = /home/nmrbox/0070/abolanos/git/cheminfo/spectrum-generator/dataset
+Ids           = data/train_2d_elong/manifest.json
+Pool          = data/pre_$(RunName)
+Seed          = 0
+PoolK         = 10
+# Por defecto sin banda 2 / aniso: el pool clasico (--hard-frac 0.25 --hard-px 2).
+Extra         = --hard-frac 0.25 --hard-px 2
+
+getenv                = True
+should_transfer_files = NO
+transfer_executable   = FALSE
+
+request_cpus   = 1
+request_memory = 8GB
+request_disk   = 15GB
++Production    = True
+
+log           = htcondor/logs/$(RunName).$(Cluster).log
+output        = htcondor/logs/$(RunName).$(Cluster).out
+error         = htcondor/logs/$(RunName).$(Cluster).err
+
+queue

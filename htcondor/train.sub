@@ -1,0 +1,45 @@
+# ---------------------------------------------------------------------------
+# Fase 2 - fine-tune del modelo 2D-US elongado (1 core, ~1-1.5 h / 210 epocas)
+#
+# Enviar SIEMPRE con el wrapper, que deja copia en htcondor/runs/:
+#   htcondor/submit.sh train.sub RunName=2026-10-26_aniso
+#
+# Los flags de bandas (Extra) tienen que ser los del pool: miralos en
+# data/<pool>/manifest.json. Defaults de abajo = receta de
+# data/pre_aniso_f2lo0_454510 (hard_frac 0.45, aniso 3 10 0 3, frac2 0.45).
+#
+# `Out` se deriva de RunName: cada envio escribe en un directorio nuevo.
+# (CSVLogger y ModelCheckpoint SOBRESCRIBEN si reusas el mismo --out.)
+# ---------------------------------------------------------------------------
+
+universe      = vanilla
+executable    = /home/nmrbox/0070/abolanos/vtflow/bin/python
+
+arguments     = scripts/train_model.py --data $(Data) --preextracted --init $(Init) --lr $(Lr) --batch $(Batch) --bg-ratio $(BgRatio) --epochs $(Epochs) --patience $(Patience) $(Extra) --out $(Out)
+
+# --- valores por defecto (el wrapper puede pisar cualquiera antes de queue) ---
+Data          = data/pre_aniso_f2lo0_454510
+Init          = Trained/Probability_2D/US/DNN_0
+Lr            = 1e-4
+Batch         = 65536
+BgRatio       = 4
+Epochs        = 210
+Patience      = 20
+Extra         = --hard-frac 0.45 --hard-px 2 --hard-aniso 3 10 0 3 --hard-frac2 0.45
+Out           = Trained/out_$(RunName)
+
+# --- entorno / ejecucion ----------------------------------------------------
+getenv                = True
+should_transfer_files = NO
+transfer_executable   = FALSE
+
+request_cpus   = 1
+request_memory = 16GB
+request_disk   = 5GB
++Production    = True
+
+log           = htcondor/logs/$(RunName).$(Cluster).log
+output        = htcondor/logs/$(RunName).$(Cluster).out
+error         = htcondor/logs/$(RunName).$(Cluster).err
+
+queue

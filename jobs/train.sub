@@ -1,0 +1,54 @@
+# ---------------------------------------------------------------------------
+# mrai_p3 training on NMRbox HTCondor
+#
+#   1. USERDIR ya apunta a este checkout; cambialo si movés el repo.
+#   2. condor_submit jobs/train.sub
+#   3. condor_q            # and condor_q -better <id> if it stays Idle
+#
+# arguments = RUN_NAME POOL [extra train_model.py args...]
+# The hard-negative geometry is read from the pool manifest by run_train.sh,
+# so pool and training cannot drift apart.
+# ---------------------------------------------------------------------------
+
+universe = vanilla
+
+USERDIR = /home/nmrbox/0070/abolanos/git/mrai_p3
+
+executable = $(USERDIR)/jobs/run_train.sh
+arguments  = out_nmrbox_454510 pre_aniso_f2lo0_454510
+
+log    = $(USERDIR)/jobs/logs/train_$(Cluster).$(Process).log
+output = $(USERDIR)/jobs/logs/train_$(Cluster).$(Process).out
+error  = $(USERDIR)/jobs/logs/train_$(Cluster).$(Process).err
+
+# Shared filesystem: the job reads/writes your home directly, no staging by
+# HTCondor. run_train.sh still copies the pool to the node-local execute dir.
+getenv                = True
+should_transfer_files = NO
+transfer_executable   = FALSE
+
+# Un solo valor para CPUs y threads: no se pueden desincronizar.
+# No pidas 48: los jobs multicore quedan detrás de la cola single-core.
+Threads = 8
+
+environment = "MRAI_THREADS=$(Threads)"
+
+# getenv=True propaga MRAI_PYTHON / MRAI_STAGE / MRAI_INIT del shell que hace
+# condor_submit; exportalos ahí si querés otro intérprete o apagar el staging.
+request_cpus   = $(Threads)
+request_memory = 8GB
+request_disk   = 16GB
+
++Production = True
+
+# --- another run in the same submission -------------------------------------
+# arguments = out_nmrbox_306010 pre_aniso_f2lo0_306010
+# queue
+
+queue
+
+# --- GPU variant (A100/H100/V100 are HTCondor-only) -------------------------
+# Check first: condor_status -af Name GPUs_Capability
+#   request_gpus = 1
+#   requirements = (GPUs_Capability >= 8)
+# and verify that the node's CUDA matches your TensorFlow build.
