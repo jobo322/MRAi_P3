@@ -139,8 +139,26 @@ def band_sections(n_bg, hard_frac, hard_frac2=0.0):
     return n_hard, n_band2, n_bg - n_hard - n_band2
 
 
+def axis_sections(n_band2, band2_axis_frac):
+    """(n_axis, n_rest): el cupo del eje F1 puro dentro de la banda 2.
+
+    `band2_axis_frac` es la fracción del presupuesto de la banda que se
+    reserva a los píxeles del eje F1 (d2 == 0): 0.20 fija la relación
+    eje:diagonal 1:4 y 0.25 la 1:3. Sin cupo el sorteo uniforme de la banda
+    la deja en la proporción natural (~1:5), porque los píxeles diagonales
+    son ~6x más numerosos que los axiales y el fondo hereda ese sesgo.
+    """
+    n_band2 = max(0, int(n_band2))
+    f = float(band2_axis_frac)
+    if f < 0 or f > 1:
+        raise ValueError(f"band2_axis_frac ({f}) debe estar en [0, 1]")
+    n_axis = min(n_band2, int(round(n_band2 * f)))
+    return n_axis, n_band2 - n_axis
+
+
 def choose_background(candidates, d_candidates, n_bg, hard_frac, hard_px,
-                      rng, band2_px=None, band2_frac=0.0, band2_mask=None):
+                      rng, band2_px=None, band2_frac=0.0, band2_mask=None,
+                      band2_axis_mask=None, band2_axis_frac=0.0):
     """Posiciones (dentro de `candidates`) del fondo de una época.
 
     Devuelve `n_bg` posiciones sin repetición: `hard_frac` del anillo
@@ -156,6 +174,15 @@ def choose_background(candidates, d_candidates, n_bg, hard_frac, hard_px,
 
     Con `band2_frac = 0` (o `band2_px=None`) el sorteo es EXACTAMENTE el
     histórico: misma secuencia de `rng`, mismo orden de salida.
+
+    `band2_axis_frac` (0 = apagado) reparte el presupuesto de la banda
+    anisótropa: esa fracción sale de los píxeles del eje F1 puro
+    (`band2_axis_mask`, los de d2 == 0) y el resto de la diagonal. Sin cupo
+    la banda sale en la proporción natural eje:diagonal ~1:5; 0.20 la fija
+    en 1:4 y 0.25 en 1:3. Si en la banda faltan píxeles de una de las dos
+    clases, el faltante lo absorbe el resto uniforme: el tamaño no cambia.
+    Con `band2_axis_frac = 0` ni la máscara ni el cupo se miran: la secuencia
+    de `rng` y el resultado son byte a byte los del camino histórico.
     """
     candidates = np.asarray(candidates)
     d_candidates = np.asarray(d_candidates)
@@ -173,6 +200,23 @@ def choose_background(candidates, d_candidates, n_bg, hard_frac, hard_px,
                 f"band2_mask {band2_mask.shape} != candidates {candidates.shape}")
     hard = np.where(d_candidates <= hard_px)[0]
     use_band2 = band2_frac > 0 and (band2_px is not None or band2_mask is not None)
+    axis_mask = None
+    if band2_axis_frac > 0:
+        if not use_band2:
+            raise ValueError(
+                "band2_axis_frac > 0 necesita la banda de negativos duros "
+                "(band2_frac > 0 con band2_px o band2_mask): el cupo reparte "
+                "el presupuesto de la banda, no el del fondo entero")
+        if band2_axis_mask is None:
+            raise ValueError(
+                "band2_axis_frac > 0 necesita band2_axis_mask (los píxeles "
+                "del eje dentro de la banda): sin ella el cupo no se puede "
+                "aplicar")
+        axis_mask = np.asarray(band2_axis_mask)
+        if axis_mask.shape != candidates.shape:
+            raise ValueError(
+                f"band2_axis_mask {axis_mask.shape} != candidates "
+                f"{candidates.shape}")
     if use_band2:
         if band2_mask is not None:
             band2 = np.where(band2_mask & (d_candidates > hard_px))[0]
@@ -190,9 +234,31 @@ def choose_background(candidates, d_candidates, n_bg, hard_frac, hard_px,
     n_hard = min(len(hard), n_hard_req)
     take_hard = (rng.choice(hard, size=n_hard, replace=False) if n_hard
                  else np.array([], dtype=np.int64))
-    n_band2 = min(len(band2), n_band2_req)
-    take_band2 = (rng.choice(band2, size=n_band2, replace=False) if n_band2
-                  else np.array([], dtype=np.int64))
+    if axis_mask is not None:
+        # Cupo eje:diagonal dentro de la banda. Rama aparte a propósito: con
+        # cupo 0 el sorteo de la banda tiene que seguir siendo la UNICA llamada
+        # a rng.choice de abajo, byte a byte como siempre (tests que fijan la
+        # secuencia de rng).
+        n_axis_req, _ = axis_sections(n_band2_req, band2_axis_frac)
+        axis = np.where(axis_mask & (d_candidates > hard_px))[0]
+        if band2_mask is not None:
+            diag = np.where(band2_mask & (d_candidates > hard_px)
+                            & ~axis_mask)[0]
+        else:  # banda isotrópica (band2_px): la diagonal es band2 sin el eje
+            diag = np.setdiff1d(band2, axis)
+        n_axis = min(len(axis), n_axis_req)
+        n_diag = min(len(diag), n_band2_req - n_axis)
+        parts = []
+        if n_axis:
+            parts.append(rng.choice(axis, size=n_axis, replace=False))
+        if n_diag:
+            parts.append(rng.choice(diag, size=n_diag, replace=False))
+        take_band2 = (np.concatenate(parts) if parts
+                      else np.array([], dtype=np.int64))
+    else:
+        n_band2 = min(len(band2), n_band2_req)
+        take_band2 = (rng.choice(band2, size=n_band2, replace=False) if n_band2
+                      else np.array([], dtype=np.int64))
     taken = np.concatenate([take_hard, take_band2])
 
     # El resto absorbe lo que falte en las bandas, así el tamaño nunca cambia.

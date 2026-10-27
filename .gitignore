@@ -28,4 +28,4 @@ jobs/logs/*
 # out_elong-20261015T162906Z-1-001.zip. When the same run is also present
 # as a directory (Trained/out_elong/), the zip is a byte-identical copy.
 # Scoped to Trained/ so it cannot hide artifacts elsewhere.
-Trained/*-1-001.zip
+Trained/

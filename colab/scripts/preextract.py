@@ -35,7 +35,10 @@ hard_band2). --hard-aniso F1LO F1HI F2LO F2HI replaces it with a rectangle
 per axis (F1 = rows, F2 = columns) using d1/d2, the row/column distance to
 the nearest positive; the npz then also stores d1/d2 so train_model.py
 --hard-aniso can resample the band each epoch. The ring keeps priority and
-a row never lands in two bands.
+a row never lands in two bands. --hard-axis-frac reserves part of the
+band budget for the pure F1 axis pixels inside the band (d2 == 0):
+0.20 fixes the axis:diagonal ratio at 1:4, 0.25 at 1:3 (uniform band
+sampling leaves ~1:5); needs --hard-aniso with F2LO = 0.
 
 Why: BinSequence._points re-runs split_2d (~1-2 s/spectrum) EVERY epoch
 -> 1000 spectra x 210 epochs ~= 60-110 h of CPU just recomputing the
@@ -123,7 +126,7 @@ def load_pair(ds_dir, sid):
 
 def plan_pool_idx(L, pool_k, max_pts=None, rng=None, hard_frac=0.0,
                   hard_px=HARD_PX, band2_px=None, band2_frac=0.0,
-                  aniso=None):
+                  aniso=None, band2_axis_frac=0.0):
     """Rows that form the pool: all positives, then the background budget.
 
     Layout: [positivos | anillo | banda2 | fáciles]. El fondo se reparte entre
@@ -149,7 +152,28 @@ def plan_pool_idx(L, pool_k, max_pts=None, rng=None, hard_frac=0.0,
     histórico: una sola llamada a `rng.choice` sobre todos los negativos, en el
     mismo orden, así que el pool guardado para una semilla no cambia
     (tests/test_split_rows.py).
+
+    `band2_axis_frac` (0 = apagado) reserva esa fracción del presupuesto de la
+    banda anisótropa a los píxeles del eje F1 puro (d2 == 0, la columna del
+    pico): 0.20 fija la relación eje:diagonal 1:4 y 0.25 la 1:3. Necesita una
+    banda con F2LO = 0 —sin la columna del eje no hay píxeles axiales que
+    reservar— y `band2_frac > 0`; el tamaño del pool no cambia.
     """
+    if band2_axis_frac > 0:
+        if aniso is None:
+            raise ValueError(
+                "band2_axis_frac > 0 necesita aniso: el cupo reparte el "
+                "presupuesto de la banda anisótropa entre el eje (d2 == 0) "
+                "y la diagonal")
+        if aniso[2] != 0:
+            raise ValueError(
+                f"band2_axis_frac > 0 necesita una banda con F2LO = 0 "
+                f"(aniso={aniso}): sin la columna del eje (d2 == 0) dentro "
+                f"de la banda no hay píxeles axiales que reservar")
+        if band2_frac <= 0:
+            raise ValueError(
+                "band2_axis_frac > 0 necesita band2_frac > 0: el cupo "
+                "reparte el presupuesto de la banda anisótropa")
     if aniso is not None and band2_frac <= 0:
         raise ValueError(
             "--hard-aniso necesita --hard-frac2 > 0: es la fracción del "
@@ -166,17 +190,24 @@ def plan_pool_idx(L, pool_k, max_pts=None, rng=None, hard_frac=0.0,
     n_hard, n_band2, _ = band_sections(n_bg, hard_frac, band2_frac)
     if (hard_frac > 0 and n_hard > 0) or (band2_frac > 0 and n_band2 > 0):
         band2_mask = None
+        band2_axis_mask = None
         if aniso is not None:
             d_full, d1_full, d2_full = axis_distance_to_positive(L)
             d_neg = d_full.reshape(-1)[neg]
-            band2_mask = aniso_band_mask(d1_full.reshape(-1)[neg],
-                                         d2_full.reshape(-1)[neg], *aniso)
+            d2_neg = d2_full.reshape(-1)[neg]
+            band2_mask = aniso_band_mask(d1_full.reshape(-1)[neg], d2_neg,
+                                         *aniso)
+            if band2_axis_frac > 0:
+                # Eje F1 puro dentro de la banda: la columna del pico (d2 == 0).
+                band2_axis_mask = band2_mask & (d2_neg == 0)
         else:
             d_neg = distance_to_positive(L).reshape(-1)[neg]
         bg = neg[choose_background(neg, d_neg, n_bg, hard_frac, hard_px, rng,
                                    band2_px=band2_px,
                                    band2_frac=band2_frac,
-                                   band2_mask=band2_mask)]
+                                   band2_mask=band2_mask,
+                                   band2_axis_mask=band2_axis_mask,
+                                   band2_axis_frac=band2_axis_frac)]
     else:
         bg = rng.choice(neg, size=max(0, n_bg), replace=False)
     return np.concatenate([pos, bg]), n_pos
@@ -289,6 +320,13 @@ def main():
                          "--hard-band2 (excluyentes) y usa --hard-frac2 como "
                          "fracción; guarda d1/d2 en el npz para que "
                          "train_model.py --hard-aniso pueda remuestrear")
+    ap.add_argument("--hard-axis-frac", type=float, default=0.0,
+                    help="fracción del presupuesto de la banda (--hard-frac2) "
+                         "reservada a los píxeles del EJE F1 (d2 == 0) dentro "
+                         "de --hard-aniso; 0.20 fija la relación "
+                         "eje:diagonal 1:4 y 0.25 la 1:3 (el sorteo uniforme "
+                         "de la banda deja ~1:5). 0 = apagado; necesita "
+                         "--hard-aniso con F2LO = 0 y --hard-frac2 > 0")
     ap.add_argument("--pair-px", type=float, default=0.0,
                     help="radio en px para marcar PARES APRETADOS "
                          "(0 = apagado): un pico se marca si otro con amplitud "
@@ -331,6 +369,21 @@ def main():
         if f1lo < 0 or f2lo < 0 or f1lo > f1hi or f2lo > f2hi:
             ap.error(f"--hard-aniso {args.hard_aniso}: se espera "
                      f"0 <= F1LO <= F1HI y 0 <= F2LO <= F2HI")
+    if args.hard_axis_frac < 0 or args.hard_axis_frac > 1:
+        ap.error(f"--hard-axis-frac ({args.hard_axis_frac}) debe estar en "
+                 f"[0, 1]")
+    if args.hard_axis_frac > 0:
+        if not args.hard_aniso:
+            ap.error("--hard-axis-frac necesita --hard-aniso: el cupo reparte "
+                     "el presupuesto de la banda anisótropa")
+        if args.hard_aniso[2] != 0:
+            ap.error(f"--hard-axis-frac necesita --hard-aniso con F2LO = 0 "
+                     f"(recibido F2LO={args.hard_aniso[2]}): sin la columna "
+                     f"del eje (d2 == 0) no hay píxeles axiales dentro de la "
+                     f"banda")
+        if args.hard_frac2 <= 0:
+            ap.error("--hard-axis-frac necesita --hard-frac2 > 0: el cupo "
+                     "reparte el presupuesto de la banda")
     if args.hard_frac + args.hard_frac2 > 1.0 + 1e-9:
         ap.error(f"--hard-frac ({args.hard_frac}) + --hard-frac2 "
                  f"({args.hard_frac2}) no pueden sumar más de 1")
@@ -367,7 +420,8 @@ def main():
                                    hard_frac=args.hard_frac, hard_px=args.hard_px,
                                    band2_px=args.hard_band2 or None,
                                    band2_frac=args.hard_frac2,
-                                   aniso=args.hard_aniso)
+                                   aniso=args.hard_aniso,
+                                   band2_axis_frac=args.hard_axis_frac)
         if args.hard_aniso:
             d_full, d1_full, d2_full = axis_distance_to_positive(L)
             d_pool = d_full.reshape(-1)[idx]
@@ -430,6 +484,7 @@ def main():
                "hard_frac": args.hard_frac, "hard_px": args.hard_px,
                "hard_band2": args.hard_band2, "hard_frac2": args.hard_frac2,
                "hard_aniso": args.hard_aniso,
+               "hard_axis_frac": args.hard_axis_frac,
                "max_pts": args.max_pts, "shape": list(SHAPE),
                "train": [i for i in man["train"] if i in done],
                "val": [i for i in man["val"] if i in done]}
@@ -448,6 +503,9 @@ def main():
               if args.hard_aniso else
               f"({args.hard_px} < d <= {args.hard_band2} px)")
            if args.hard_frac2 > 0 else "") +
+          (f" · cupo del eje F1 en la banda: "
+           f"{args.hard_axis_frac * 100:.0f} % (d2 == 0)"
+           if args.hard_axis_frac > 0 else "") +
           f" · el submuestreo por época lo elige con train_model.py --hard-frac"
           f" (0 = fondo uniforme)")
 

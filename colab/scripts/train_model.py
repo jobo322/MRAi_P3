@@ -27,7 +27,9 @@ modelo entrenado daba P > 0,5 al 81 % de los vecinos inmediatos de un pico.
 (`d <= --hard-px`), usando las distancias que guarda preextract.py en `d`.
 `--hard-band2`/`--hard-frac2` añaden una banda media isotrópica y
 `--hard-aniso F1LO F1HI F2LO F2HI` la sustituye por un rectángulo por eje
-(d1/d2, también guardados por preextract.py --hard-aniso).
+(d1/d2, también guardados por preextract.py --hard-aniso). `--hard-axis-frac`
+reserva parte del presupuesto de esa banda al eje F1 puro (d2 == 0): 0.20 fija
+la relación eje:diagonal 1:4 y 0.25 la 1:3 (el sorteo uniforme deja ~1:5).
 
 Copia de pesos (`--init`): POR ROL, derivado del grafo del SavedModel base
 (scripts/weight_roles.py). Emparejar por forma o por nombre no vale: las dos
@@ -207,7 +209,7 @@ def _pools_missing_axis_d(pre_dir, ids):
 def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
                    hard_frac=0.0, hard_px=HARD_PX, band2_px=None,
                    band2_frac=0.0, pair=None, pair_frac=0.0,
-                   d1=None, d2=None, aniso=None):
+                   d1=None, d2=None, aniso=None, band2_axis_frac=0.0):
     """Muestreo por época desde un pool pre-extraído.
 
     Toma TODOS los positivos (filas 0:n_pos) + `bg_ratio * n_pos` filas de
@@ -234,6 +236,14 @@ def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
     `F2LO <= d2 <= F2HI`, siempre fuera del anillo. Sin `d1`/`d2` con `aniso`
     se falla claro (pool antiguo o generado con --hard-band2).
 
+    `band2_axis_frac` (0 = apagado) reparte el presupuesto de la banda
+    anisótropa: esa fracción sale de los píxeles del eje F1 puro (d2 == 0, la
+    columna del pico) y el resto de la diagonal. Sin cupo la banda sale en la
+    proporción natural eje:diagonal ~1:5; 0.20 la fija en 1:4 y 0.25 en 1:3.
+    Necesita `aniso` con F2LO = 0 —sin la columna del eje no hay píxeles
+    axiales dentro de la banda— y `band2_frac > 0`; el tamaño del lote no
+    cambia (el faltante lo absorbe el resto uniforme).
+
     `pair` son las marcas de PARES APRETADOS del pool (un byte por fila, lo
     guarda preextract.py --pair-px > 0): filas cuyo píxel pertenece a un pico
     enterrado en el flanco de uno mayor —un par que el perfil en cruz no puede
@@ -244,6 +254,21 @@ def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
     `pair_frac > 0` se falla claro.
     """
     n_bg = max(0, min(len(X) - n_pos, int(n_pos * bg_ratio), max_pts - n_pos))
+    if band2_axis_frac > 0 and n_bg > 0:
+        if aniso is None or d1 is None or d2 is None:
+            raise ValueError(
+                "band2_axis_frac > 0 necesita aniso con d1 y d2 del pool: "
+                "regenera con preextract.py --hard-aniso, o entrena sin "
+                "--hard-axis-frac")
+        if aniso[2] != 0:
+            raise ValueError(
+                f"band2_axis_frac > 0 necesita una banda con F2LO = 0 "
+                f"(aniso={aniso}): sin la columna del eje (d2 == 0) dentro de "
+                f"la banda no hay píxeles axiales que reservar")
+        if band2_frac <= 0:
+            raise ValueError(
+                "band2_axis_frac > 0 necesita band2_frac > 0: el cupo reparte "
+                "el presupuesto de la banda anisótropa")
     if aniso is not None and n_bg > 0:
         if d is None or d1 is None or d2 is None:
             raise ValueError(
@@ -257,13 +282,19 @@ def subsample_pool(X, y, n_pos, max_pts, bg_ratio, rng, d=None,
         cand = np.arange(n_pos, len(X))
         d_bg = np.asarray(d)[:len(cand)]
         band2_mask = None
+        band2_axis_mask = None
         if aniso is not None:
             d1_bg = np.asarray(d1)[:len(cand)]
             d2_bg = np.asarray(d2)[:len(cand)]
             band2_mask = aniso_band_mask(d1_bg, d2_bg, *aniso)
+            if band2_axis_frac > 0:
+                # Eje F1 puro dentro de la banda: la columna del pico (d2 == 0).
+                band2_axis_mask = band2_mask & (d2_bg == 0)
         bg = cand[choose_background(cand, d_bg, n_bg, hard_frac, hard_px, rng,
                                     band2_px=band2_px, band2_frac=band2_frac,
-                                    band2_mask=band2_mask)]
+                                    band2_mask=band2_mask,
+                                    band2_axis_mask=band2_axis_mask,
+                                    band2_axis_frac=band2_axis_frac)]
     else:
         bg = rng.choice(len(X) - n_pos, size=n_bg, replace=False) + n_pos
     if pair_frac > 0:
@@ -299,12 +330,14 @@ class BinSequence:
     hard_band2 = 0
     hard_frac2 = 0.0
     hard_aniso = None
+    band2_axis_frac = 0.0
     pair_frac = 0.0
 
     def __init__(self, ds_dir, ids, batch=65536, max_pts=65536, seed=0,
                  shuffle=True, bg_ratio=4.0, fast_split=True,
                  hard_frac=0.0, hard_px=HARD_PX, hard_band2=0,
-                 hard_frac2=0.0, pair_frac=0.0, hard_aniso=None):
+                 hard_frac2=0.0, pair_frac=0.0, hard_aniso=None,
+                 band2_axis_frac=0.0):
         import tensorflow as tf
         self.ds_dir = ds_dir
         self.ids = list(ids)
@@ -318,6 +351,7 @@ class BinSequence:
         self.hard_band2 = hard_band2
         self.hard_frac2 = hard_frac2
         self.hard_aniso = hard_aniso
+        self.band2_axis_frac = band2_axis_frac
         self.pair_frac = pair_frac
         self.tf = tf
         # Por defecto solo se calculan las filas muestreadas (split_2d_rows,
@@ -395,15 +429,34 @@ class BinSequence:
         n_bg = max(0, min(len(y) - len(pos), int(len(pos) * self.bg_ratio),
                           self.max_pts - len(pos)))
         neg = np.where(y[:, 0] < 0.5)[0]
+        if self.band2_axis_frac > 0:
+            if self.hard_aniso is None:
+                raise ValueError(
+                    "band2_axis_frac > 0 necesita --hard-aniso: el cupo "
+                    "reparte el presupuesto de la banda anisótropa")
+            if self.hard_aniso[2] != 0:
+                raise ValueError(
+                    f"band2_axis_frac > 0 necesita una banda con F2LO = 0 "
+                    f"(hard_aniso={self.hard_aniso}): sin la columna del eje "
+                    f"(d2 == 0) no hay píxeles axiales dentro de la banda")
+            if self.hard_frac2 <= 0:
+                raise ValueError(
+                    "band2_axis_frac > 0 necesita --hard-frac2 > 0: el cupo "
+                    "reparte el presupuesto de la banda")
         if self.hard_frac > 0 or self.hard_frac2 > 0:
             # ruta sin pre-extraccion: la distancia se calcula aquí mismo
             band2_mask = None
+            band2_axis_mask = None
             if self.hard_aniso is not None:
                 d_full, d1_full, d2_full = axis_distance_to_positive(L)
                 d_flat = d_full.reshape(-1)
+                d2_flat = d2_full.reshape(-1)
                 band2_mask = aniso_band_mask(
-                    d1_full.reshape(-1)[neg], d2_full.reshape(-1)[neg],
+                    d1_full.reshape(-1)[neg], d2_flat[neg],
                     *self.hard_aniso)
+                if self.band2_axis_frac > 0:
+                    # Eje F1 puro dentro de la banda: la columna del pico.
+                    band2_axis_mask = band2_mask & (d2_flat[neg] == 0)
             else:
                 d_flat = distance_to_positive(L).reshape(-1)
             take_neg = neg[choose_background(neg, d_flat[neg], n_bg,
@@ -411,7 +464,9 @@ class BinSequence:
                                              self.rng,
                                              band2_px=self.hard_band2 or None,
                                              band2_frac=self.hard_frac2,
-                                             band2_mask=band2_mask)]
+                                             band2_mask=band2_mask,
+                                             band2_axis_mask=band2_axis_mask,
+                                             band2_axis_frac=self.band2_axis_frac)]
         else:
             take_neg = self.rng.choice(neg, size=max(0, n_bg), replace=False)
         idx = np.concatenate([pos, take_neg])
@@ -442,7 +497,8 @@ class BinSequence:
                                 band2_px=self.hard_band2 or None,
                                 band2_frac=self.hard_frac2,
                                 pair=pair, pair_frac=self.pair_frac,
-                                d1=d1, d2=d2, aniso=self.hard_aniso)
+                                d1=d1, d2=d2, aniso=self.hard_aniso,
+                                band2_axis_frac=self.band2_axis_frac)
         return np.ascontiguousarray(Xs), np.ascontiguousarray(ys)
 
     def __iter__(self):
@@ -646,6 +702,14 @@ def main():
                          "--hard-band2 (excluyentes) y usa --hard-frac2. "
                          "Requiere un pool de preextract.py --hard-aniso "
                          "(con d1/d2)")
+    ap.add_argument("--hard-axis-frac", type=float, default=0.0,
+                    help="fracción del presupuesto de la banda (--hard-frac2) "
+                         "reservada a los píxeles del EJE F1 (d2 == 0) dentro "
+                         "de --hard-aniso; 0.20 fija la relación "
+                         "eje:diagonal 1:4 y 0.25 la 1:3 (el sorteo uniforme "
+                         "de la banda deja ~1:5). 0 = apagado; necesita "
+                         "--hard-aniso con F2LO = 0 y --hard-frac2 > 0, y un "
+                         "pool generado con la misma --hard-axis-frac")
     ap.add_argument("--pair-frac", type=float, default=0.0,
                     help="sobremuestreo de PARES APRETADOS: cada época añade "
                          "round(pair-frac x n_pos) filas extra sorteadas con "
@@ -687,6 +751,21 @@ def main():
         if args.hard_frac2 <= 0:
             ap.error("--hard-aniso necesita --hard-frac2 > 0 (la fracción del "
                      "fondo que sale de la banda anisótropa)")
+    if args.hard_axis_frac < 0 or args.hard_axis_frac > 1:
+        ap.error(f"--hard-axis-frac ({args.hard_axis_frac}) debe estar en "
+                 f"[0, 1]")
+    if args.hard_axis_frac > 0:
+        if not args.hard_aniso:
+            ap.error("--hard-axis-frac necesita --hard-aniso: el cupo reparte "
+                     "el presupuesto de la banda anisótropa")
+        if args.hard_aniso[2] != 0:
+            ap.error(f"--hard-axis-frac necesita --hard-aniso con F2LO = 0 "
+                     f"(recibido F2LO={args.hard_aniso[2]}): sin la columna "
+                     f"del eje (d2 == 0) no hay píxeles axiales dentro de la "
+                     f"banda")
+        if args.hard_frac2 <= 0:
+            ap.error("--hard-axis-frac necesita --hard-frac2 > 0: el cupo "
+                     "reparte el presupuesto de la banda")
     if args.pair_frac > 0 and not args.preextracted:
         raise SystemExit(
             "ERROR: --pair-frac solo funciona en modo pre-extraído "
@@ -735,7 +814,8 @@ def main():
                             hard_band2=args.hard_band2,
                             hard_frac2=args.hard_frac2,
                             pair_frac=args.pair_frac,
-                            hard_aniso=args.hard_aniso)
+                            hard_aniso=args.hard_aniso,
+                            band2_axis_frac=args.hard_axis_frac)
     val_seq = BinSequence(ds_dir, val_ids, batch=args.batch,
                           max_pts=args.max_pts, seed=args.seed + 1, shuffle=False,
                           bg_ratio=args.bg_ratio,
@@ -744,7 +824,8 @@ def main():
                           hard_band2=args.hard_band2,
                           hard_frac2=args.hard_frac2,
                           pair_frac=args.pair_frac,
-                          hard_aniso=args.hard_aniso)
+                          hard_aniso=args.hard_aniso,
+                          band2_axis_frac=args.hard_axis_frac)
     if not args.preextracted:
         used = ("por filas (split_2d_rows)" if train_seq.fast_split
                 else "completo (--slow-split)")
@@ -794,6 +875,31 @@ def main():
                 f"sin avisar. Regenera el pool con scripts/preextract.py "
                 f"--pair-px 6 (y el --pair-ratio que quieras), o entrena con "
                 f"--pair-frac 0.")
+        # El cupo del eje cambia la COMPOSICION de la banda del pool (qué
+        # filas de la banda entraron), no solo el muestreo por época: si el
+        # pool se generó con otra fracción, el fondo de cada época sale de una
+        # banda con otra relación eje:diagonal sin avisar.
+        pool_axis_frac = man.get("hard_axis_frac")
+        if args.hard_axis_frac > 0 and pool_axis_frac is None:
+            raise SystemExit(
+                f"ERROR: el pool de {args.data} no registra `hard_axis_frac` "
+                f"en manifest.json (pool generado sin la clave), así que no se "
+                f"puede verificar el cupo del eje. Regenera el pool con "
+                f"scripts/preextract.py --hard-aniso {args.hard_aniso[0]} "
+                f"{args.hard_aniso[1]} {args.hard_aniso[2]} "
+                f"{args.hard_aniso[3]} --hard-frac2 {args.hard_frac2} "
+                f"--hard-axis-frac {args.hard_axis_frac}, o entrena con "
+                f"--hard-axis-frac 0.")
+        if (pool_axis_frac is not None
+                and abs(float(pool_axis_frac) - args.hard_axis_frac) > 1e-9):
+            raise SystemExit(
+                f"ERROR: el pool de {args.data} se generó con hard_axis_frac "
+                f"{pool_axis_frac} y el entrenamiento pide "
+                f"{args.hard_axis_frac}: la composición de la banda del pool "
+                f"no coincide con el cupo pedido. Regenera el pool con la "
+                f"misma fracción (scripts/preextract.py --hard-axis-frac "
+                f"{args.hard_axis_frac}), o entrena con --hard-axis-frac "
+                f"{pool_axis_frac}.")
     os.makedirs(args.out, exist_ok=True)
     # --scratch: el entrenamiento escribe en local y se sincroniza a --out.
     ckpt_dir = args.scratch or args.out
