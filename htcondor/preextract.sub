@@ -3,7 +3,7 @@
 #
 #   htcondor/submit.sh preextract.sub RunName=2b \
 #       Pool=data/pre_elong_2b \
-#       Extra="--pool-k 24 --hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25"
+#       Extra="--hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25"
 #
 # Ojo: --pool-k debe ser > el --bg-ratio que uses al entrenar (10 > 4).
 # ---------------------------------------------------------------------------
@@ -13,7 +13,7 @@ executable    = /home/nmrbox/0070/abolanos/vtflow/bin/python
 
 arguments     = scripts/preextract.py --dataset $(Dataset) --ids $(Ids) --out $(Pool) --seed $(Seed) --pool-k $(PoolK) $(Extra)
 
-Dataset       = /home/nmrbox/0070/abolanos/git/cheminfo/spectrum-generator/dataset
+Dataset       = /home/nmrbox/0070/abolanos/git/spectrum-generator/dataset
 Ids           = data/train_2d_elong/manifest.json
 Pool          = data/pre_$(RunName)
 Seed          = 0
