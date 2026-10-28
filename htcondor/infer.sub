@@ -14,10 +14,10 @@ arguments     = scripts/plotting/infer_batch.py --n $(N) --split $(Split) --mode
 
 N             = 100
 Split         = val
-Model         = Trained/out_elong_2b_savedmodel
+# Model is set via submit.sh override: Model=Trained/out_aniso_a00_savedmodel etc.
 Out           = Trained/infer_$(RunName)
 # La cadena medida (equivale a los defaults actuales, pero explicita):
-Extra         = --spe-the 0.2 --pl-the 0.6 --msep 3 1
+Extra         = --spe-the 0.2 --pl-the 0.6 --msep 3 1 --dataset /home/nmrbox/0070/abolanos/git/spectrum-generator/dataset --keep
 
 getenv                = True
 should_transfer_files = NO
@@ -28,8 +28,8 @@ request_memory = 12GB
 request_disk   = 5GB
 +Production    = True
 
-log           = htcondor/logs/$(RunName).$(Cluster).log
-output        = htcondor/logs/$(RunName).$(Cluster).out
-error         = htcondor/logs/$(RunName).$(Cluster).err
+log           = htcondor/logs/$(RunName).infer.$(Cluster).log
+output        = htcondor/logs/$(RunName).infer.$(Cluster).out
+error         = htcondor/logs/$(RunName).infer.$(Cluster).err
 
 queue
