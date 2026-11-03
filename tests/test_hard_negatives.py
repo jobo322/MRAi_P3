@@ -26,8 +26,9 @@ import numpy as np
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 
-from hard_negatives import (choose_background, distance_to_positive,  # noqa: E402
-                            pool_sections, split_negatives)
+from hard_negatives import (aniso_band_mask, choose_background,  # noqa: E402
+                            distance_to_positive, pool_sections,
+                            split_negatives, _sorted_complement)
 from preextract import build_pool, plan_pool_idx  # noqa: E402
 from train_model import subsample_pool  # noqa: E402
 
@@ -252,6 +253,118 @@ class TestEpochSample(unittest.TestCase):
                                np.random.default_rng(1), d=d_bg,
                                hard_frac=0.5, hard_px=HARD_PX)
         self.assertEqual(len(sx), n_pos + int(n_pos * 4.0))
+
+
+class TestSortedComplement(unittest.TestCase):
+    """`rest` (el complemento de las filas reservadas) sale en orden ASCENDENTE
+    y sin repetir, que es lo que garantiza el histórico
+    `np.setdiff1d(np.arange(n), reserved)`.
+
+    El orden no es cosmético: `choose_background` sortea `rest` con
+    `rng.choice(..., replace=False)`, que indexa por POSICIÓN. Si `rest`
+    cambiara de orden, la misma semilla elegiría OTRAS filas de fondo y el
+    muestreo dejaría de ser reproducible byte a byte: es el contrato que fijan
+    test_hard_bands.py y test_pool_equiv.py, y del que dependen los pools ya
+    generados en data/ (los generó el mismo `choose_background`).
+    """
+
+    # (n, reserved): cubre vacío, todo reservado, duplicados, desordenado y el
+    # tamaño real de un pool (14 525 filas de pre_aniso_f2lo0_306010).
+    CASES = (
+        (0, []),
+        (1, []),
+        (1, [0]),
+        (10, []),
+        (10, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        (10, [3, 3, 3]),
+        (10, [9, 0, 5]),
+        (100, list(range(30))),
+        (14525, [0, 7, 4000, 14524]),
+    )
+
+    def test_matches_the_historical_setdiff1d(self):
+        """Mismos valores, MISMO ORDEN y mismo dtype que el setdiff1d viejo.
+
+        `assert_array_equal` compara el orden, no el conjunto: es justo lo que
+        hay que preservar para no mover el muestreo.
+        """
+        for n, reserved in self.CASES:
+            with self.subTest(n=n, n_reserved=len(reserved)):
+                reserved = np.asarray(reserved, dtype=np.int64)
+                got = _sorted_complement(n, reserved)
+                want = np.setdiff1d(np.arange(n), reserved)
+                np.testing.assert_array_equal(got, want)
+                self.assertEqual(got.dtype, want.dtype)
+
+    def test_result_is_strictly_ascending_unique_and_in_range(self):
+        for n, reserved in self.CASES:
+            with self.subTest(n=n, n_reserved=len(reserved)):
+                got = _sorted_complement(n, np.asarray(reserved, dtype=np.int64))
+                if len(got) > 1:
+                    self.assertTrue(np.all(np.diff(got) > 0),
+                                    f"no ascendente: {got}")
+                self.assertEqual(len(np.unique(got)), len(got))
+                self.assertTrue(np.all((got >= 0) & (got < n)))
+
+    def test_duplicates_in_reserved_do_not_duplicate_rows(self):
+        a = _sorted_complement(10, np.array([3, 3, 3, 3]))
+        b = _sorted_complement(10, np.array([3]))
+        np.testing.assert_array_equal(a, b)
+
+    def test_empty_reserved_returns_every_position(self):
+        np.testing.assert_array_equal(
+            _sorted_complement(5, np.array([], dtype=np.int64)), np.arange(5))
+
+
+class TestComplementOrderIsLoadBearing(unittest.TestCase):
+    """Golden: las filas exactas que devuelve `choose_background`.
+
+    Grabado con la implementación de `np.setdiff1d` (antes de
+    `_sorted_complement`). Una reordenación de `rest` que conserve la fracción
+    de duros pasaría los tests de fracción pero cambiaría estas filas, que es
+    lo que hay que impedir: movería el fondo de cada época y rompería la
+    reproducibilidad de los pools y checkpoints ya existentes.
+    """
+
+    # (n, d, kwargs, seed, filas esperadas)
+    GOLDEN = (
+        # anillo puro: 30 duros (d=1) + 70 fáciles (d=30), n_bg=20, hard_frac=0.25
+        (100, (1.0, 30.0, 30), {"n_bg": 20, "hard_frac": 0.25}, 0,
+         [17, 14, 7, 9, 22, 95, 59, 66, 82, 91, 30, 48, 67, 94, 76, 64, 75,
+          69, 85, 89]),
+        (100, (1.0, 30.0, 30), {"n_bg": 20, "hard_frac": 0.25}, 1,
+         [13, 1, 21, 27, 12, 70, 67, 54, 98, 65, 47, 55, 87, 31, 46, 79, 35,
+          45, 89, 81]),
+        # anillo + banda anisótropa (reserved = hard | band2), hard_frac=0.25
+        (100, (1.0, 6.0, 20), {"n_bg": 20, "hard_frac": 0.25,
+                               "band2_frac": 0.5}, 0,
+         [10, 9, 5, 6, 13, 43, 40, 34, 29, 31, 33, 32, 41, 36, 44, 89, 54,
+          82, 84, 49]),
+        (100, (1.0, 6.0, 20), {"n_bg": 20, "hard_frac": 0.25,
+                               "band2_frac": 0.5}, 2,
+         [5, 1, 13, 4, 8, 40, 32, 26, 25, 38, 29, 33, 23, 37, 21, 66, 93,
+          56, 79, 96]),
+    )
+
+    def test_choose_background_picks_the_same_rows(self):
+        for n, (d_hard, d_mid, n_hard), kw, seed, expected in self.GOLDEN:
+            with self.subTest(n=n, n_hard=n_hard, seed=seed):
+                # 20 duros + 25 de banda + resto fácil, con la banda construida
+                # por aniso_band_mask (d1 en [3,10] y d2 en [0,3])
+                d = np.concatenate([np.full(n_hard, d_hard),
+                                    np.full(25, d_mid),
+                                    np.full(n - n_hard - 25, 40.0)])
+                kwargs = dict(kw)
+                if "band2_frac" in kwargs:
+                    d1 = np.zeros(n)
+                    d2 = np.zeros(n)
+                    d1[n_hard:n_hard + 25] = 5
+                    d2[n_hard:n_hard + 25] = 1
+                    kwargs["band2_mask"] = aniso_band_mask(d1, d2, 3, 10, 0, 3)
+                rng = np.random.default_rng(seed)
+                pick = choose_background(np.arange(n), d, rng=rng, hard_px=HARD_PX,
+                                         **kwargs)
+                np.testing.assert_array_equal(pick, np.array(expected))
 
 
 if __name__ == "__main__":

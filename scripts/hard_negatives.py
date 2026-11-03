@@ -156,6 +156,30 @@ def axis_sections(n_band2, band2_axis_frac):
     return n_axis, n_band2 - n_axis
 
 
+def _sorted_complement(n, excluded):
+    """Posiciones 0..n-1 que NO están en `excluded`, en orden ascendente.
+
+    Equivalente exacto a `np.setdiff1d(np.arange(n), excluded)` —mismos
+    valores, MISMO ORDEN y mismo dtype— pero sin ordenar: `np.arange` ya sale
+    ordenado y `excluded` son posiciones únicas, así que el `uniquify+sort` de
+    `setdiff1d` (dos pasadas O(n log n)) sobra. `choose_background` lo paga una
+    vez por espectro y por época (800 veces por época en un pool real).
+
+    El orden es parte del contrato, no un detalle: `choose_background` sortea
+    este array con `rng.choice(..., replace=False)`, que indexa por POSICIÓN,
+    así que reordenarlo elegiría otras filas de fondo con la misma semilla y
+    rompería la reproducibilidad de los pools y checkpoints ya generados. Lo
+    fija tests/test_hard_negatives.py::TestSortedComplement.
+
+    `excluded` tiene que ser posiciones en [0, n): se usa como máscara, así que
+    un valor fuera de rango o negativo no se ignora como haría `setdiff1d`.
+    """
+    mask = np.ones(int(n), dtype=bool)
+    if len(excluded):
+        mask[np.asarray(excluded, dtype=np.intp)] = False
+    return np.flatnonzero(mask)
+
+
 def choose_background(candidates, d_candidates, n_bg, hard_frac, hard_px,
                       rng, band2_px=None, band2_frac=0.0, band2_mask=None,
                       band2_axis_mask=None, band2_axis_frac=0.0):
@@ -263,7 +287,11 @@ def choose_background(candidates, d_candidates, n_bg, hard_frac, hard_px,
 
     # El resto absorbe lo que falte en las bandas, así el tamaño nunca cambia.
     reserved = np.concatenate([hard, band2]) if use_band2 else hard
-    rest = np.setdiff1d(np.arange(len(candidates)), reserved)
+    # El complemento ordenado de las filas reservadas. Antes era
+    # `np.setdiff1d(np.arange(len(candidates)), reserved)`, equivalente pero
+    # pagando dos `uniquify+sort` para devolver lo que una máscara da en dos
+    # pasadas O(n) (ver _sorted_complement).
+    rest = _sorted_complement(len(candidates), reserved)
     n_easy = n_bg - len(take_hard) - len(take_band2)
     if n_easy > len(rest):
         # Solo las filas reservadas que NO salieron: `rest` ya está en
