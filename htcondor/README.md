@@ -6,7 +6,7 @@ Guía corta y repetible para esta VM. El tutorial oficial está en
 
 ---
 
-## 0. Estado de esta VM (comprobado 2026-10-26, `antimony`)
+## 0. Estado de esta VM (comprobado 2026-10-27, `antimony`)
 
 | Cosa | Estado |
 |---|---|
@@ -14,8 +14,8 @@ Guía corta y repetible para esta VM. El tutorial oficial está en
 | `sudo` | pide contraseña; no hay regla en `/etc/sudoers.d` para el usuario |
 | `/home/nmrbox/0070/abolanos` | NFS **compartido con todo el pool** → acá van código, datos y salidas |
 | `/scratch/0070/abolanos` | disco **local de esta VM** → no lo ve ningún worker |
-| Dataset | sí: `git/cheminfo/spectrum-generator/dataset` |
-| `~/vtflow` | Python 3.12, **TF 2.21 / Keras 3.15** → entorno que usan los `.sub` |
+| Dataset | sí: `git/spectrum-generator/dataset` (1000 espectros + 1000 labels) |
+| `~/vtflow` | Python 3.12, **TF 2.21 / Keras 3.15 / numpy 2.5 / scipy 1.18** → entorno que usan los `.sub` |
 | `python3.12` | instalado en `/usr/bin`; `pip` llega a PyPI (probado: baja TF 2.20) |
 
 Consecuencia: el cliente y el venv ya están listos; solo queda elegir el
@@ -26,6 +26,9 @@ fallback.
 
 ## 1. La solicitud (una sola vez)
 
+> **Ya resuelto en `antimony`** (ver §0): el cliente está instalado y la cola
+> funciona. Esta sección queda como registro de lo que hubo que pedir.
+
 El cliente no se instala a mano: el paquete de NMRbox
 (`nmrbox-condor` + `nmrbox-condor-lts`) baja la configuración del pool desde
 `/nmrbox-system/condor/lts/` y arranca el servicio. Sin `sudo` eso lo tiene que
@@ -33,10 +36,10 @@ hacer soporte.
 
 Mandá esto a **support@nmrbox.org** (o `support@nmrhub.org`):
 
-> Asunto: Enable HTCondor on my NMRbox VM (beryllium)
+> Asunto: Enable HTCondor on my NMRbox VM (antimony)
 >
 > Hola,
-> estoy trabajando en la VM `beryllium.nmrbox.org` con el usuario `abolanos` y
+> estoy trabajando en la VM `antimony.nmrbox.org` con el usuario `abolanos` y
 > quiero enviar jobs al pool de HTCondor. El cliente no está instalado
 > (`condor_q: command not found`). ¿Podrían instalar/habilitar
 > `nmrbox-condor` y `nmrbox-condor-lts` en esta VM, o indicarme el trámite para
@@ -78,7 +81,8 @@ Es un *personal condor*: `MASTER, COLLECTOR, NEGOTIATOR, SCHEDD, STARTD` en
 `127.0.0.1`. Sirve para encolar y correr jobs **en esta VM** (65 cores,
 629 GB) con `condor_q`, logs, `condor_rm`, `condor_ssh_to_job`, etc. Verificado:
 un job con `/bin/hostname` y otro con `scripts/preextract.py --help` terminaron
-con exit 0; `condor_status` ve `slot1@beryllium` con toda la RAM.
+con exit 0; `condor_status` ve el slot local con toda la RAM (probado en
+`beryllium`; en `antimony` el estado es `/scratch/0070/abolanos/condor-local/`).
 
 **No es el pool de NMRbox.** La config pública del pool
 (`/nmrbox-system/condortest/10_pool.conf`) apunta a
@@ -119,13 +123,21 @@ cd ~/git/mrai_p3
 
 python3.12 -m venv --copies ~/vtflow
 ~/vtflow/bin/pip install --upgrade pip
-~/vtflow/bin/pip install "tensorflow>=2.16,<3" numpy
+~/vtflow/bin/pip install "tensorflow>=2.16,<3" numpy "scipy>=1.9"
 
-# comprobación (las tres tienen que pasar)
-~/vtflow/bin/python -c "import tensorflow as tf, keras; print('tf', tf.__version__, 'keras', keras.__version__)"
+# comprobación (las cuatro tienen que pasar)
+~/vtflow/bin/python -c "import tensorflow as tf, keras, scipy; print('tf', tf.__version__, 'keras', keras.__version__, 'scipy', scipy.__version__)"
 ~/vtflow/bin/python scripts/preextract.py --help   >/dev/null && echo preextract OK
 ~/vtflow/bin/python scripts/train_model.py --help  >/dev/null && echo train OK
+~/vtflow/bin/python -c "import scipy.ndimage" && echo "scipy.ndimage OK"
 ```
+
+> **`scipy` no es opcional para generar pools.** `--hard-aniso` (y con él
+> `--hard-axis-frac`) usan `scipy.ndimage.distance_transform_edt` para las
+> distancias por eje. El import es perezoso, así que `preextract.py --help`
+> **no** lo detecta: el faltante aparece recién con el primer espectro
+> (`ModuleNotFoundError: No module named 'scipy'`). El entrenamiento no lo
+> necesita (las distancias ya vienen en el `.npz`).
 
 El path `~/vtflow/bin/python` es el que usan los `.sub` de `htcondor/`.
 Si preferís otro nombre, editá la línea `executable` de cada template.
@@ -162,7 +174,9 @@ que sirve para paralelizar, no para un entrenamiento suelto.
 
 Reglas prácticas del pool (del tutorial):
 
-- jobs de **menos de 8 h**; el entrenamiento de 210 epochs entra (~1–1.5 h);
+- el pool acepta hasta **5 días por job CPU-only** y **2 días con GPU** (aviso
+  de `condor_submit` desde 2026-03-26); el entrenamiento de 210 epochs entra en
+  ~1–1,5 h, así que sobra margen;
 - preferir **1 core por job** antes que `request_cpus = 48` (los jobs multicore
   esperan a que se vacíe la cola de jobs de 1 core). El entrenamiento es la
   excepción medida: usa 8 threads porque TF rinde mucho mejor así
@@ -175,7 +189,7 @@ Reglas prácticas del pool (del tutorial):
 ## 4. Enviar — el checklist de cada vez
 
 ```bash
-ssh beryllium.nmrbox.org          # la VM donde esté habilitado Condor
+ssh antimony.nmrbox.org           # la VM donde está habilitado Condor
 cd ~/git/mrai_p3
 source ~/htcondor-portable/activate.sh   # cliente portátil (§1.1); con el de soporte, no hace falta
 ```
@@ -191,11 +205,19 @@ source ~/htcondor-portable/activate.sh   # cliente portátil (§1.1); con el de 
    a mano**: `htcondor/run_train.sh` la lee del manifest del pool. Los pools que
    hay hoy en esta VM:
 
-   | pool | banda |
-   |---|---|
-   | `data/pre_aniso_f2lo0_454510` | `3-10 × 0-3`, `hard_frac 0.45 / frac2 0.45` |
-   | `data/pre_aniso_f2lo0_552520` | `3-10 × 0-3`, `hard_frac 0.55 / frac2 0.25` |
-   | `data/pre_aniso_f2lo0_306010` | **incompleto** (523 npz, sin manifest) → no usar |
+   | pool | banda | estado |
+   |---|---|---|
+   | `data/pre_aniso_f2lo0_454510` | `3-10 × 0-3`, `0.45 / 0.45` | completo |
+   | `data/pre_aniso_f2lo0_552520` | `3-10 × 0-3`, `0.55 / 0.25` | completo |
+   | `data/pre_aniso_f2lo0_3268_f2hi4_a00` | `3-8 × 0-4`, `0.32 / 0.68`, cupo 0 (natural 0.160) | verificado 2026-10-27 |
+   | `data/pre_aniso_f2lo0_3268_f2hi4_a20` | `3-8 × 0-4`, `0.32 / 0.68`, cupo 0.20 (1:4) | verificado 2026-10-27 |
+   | `data/pre_aniso_f2lo0_3268_f2hi4_a25` | `3-8 × 0-4`, `0.32 / 0.68`, cupo 0.25 (1:3) | verificado 2026-10-27 |
+   | `data/pre_aniso_f2lo0_306010` | `3-10 × 0-3`, `0.30 / 0.60` | completo (1000 npz + manifest) |
+
+   Los tres `3268_f2hi4_a*` son los brazos del A/B del cupo del eje: 1000 `.npz`
+   cada uno (~7 GB), mismo anillo y banda, solo cambia la mezcla eje:diagonal.
+   La ejecución y los números medidos están en
+   `docs/runs/2026-10-27-pools-3268-ejecucion-40f85a5.md`.
 
    Para inspeccionar (o para pasarle los flags a `preextract.py`, o a
    `train_model.py` a mano) está el helper, que es la única fuente de verdad de
@@ -239,12 +261,12 @@ source ~/htcondor-portable/activate.sh   # cliente portátil (§1.1); con el de 
    ```bash
    htcondor/submit.sh preextract.sub RunName=2b \
        Pool=data/pre_elong_2b PoolK=24 \
-       Extra="--pool-k 24 --hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25"
+       Extra="--hard-frac 0.55 --hard-px 2 --hard-band2 6 --hard-frac2 0.25"
 
-   # pool con cupo del eje (1:3 dentro de la banda 3-8 x 0-4):
+   # pool con cupo del eje (1:3 dentro de la banda 3-8 × 0-4):
    htcondor/submit.sh preextract.sub RunName=aniso_a25 \
        Pool=data/pre_aniso_f2lo0_3268_f2hi4_a25 PoolK=24 \
-       Extra="--pool-k 24 --hard-frac 0.32 --hard-px 2 --hard-aniso 3 8 0 4 --hard-frac2 0.68 --hard-axis-frac 0.25"
+       Extra="--hard-frac 0.32 --hard-px 2 --hard-aniso 3 8 0 4 --hard-frac2 0.68 --hard-axis-frac 0.25"
    ```
 
    Inferencia por lote:
@@ -302,8 +324,8 @@ salen de ahí: el wrapper es el camino recomendado.
 - `request_disk = 16GB`: el pool stageado son 7 GB + checkpoints.
 - `+Production = True` es necesario: `~/vtflow` **no** es autocontenido
   (`pyvenv.cfg: home = /usr/bin`, stdlib del sistema).
-- 48 h máximo por job; checkpointing obligatorio arriba de 48 h (acá ya lo hay
-  cada 5 épocas).
+- 5 días máximo por job CPU-only y 2 días con GPU (desde 2026-03-26); el
+  checkpointing cada 5 épocas hace que una evicción se reanude sin perder todo.
 - Jobs grandes van **solo** por HTCondor, no por VNC/SSH.
 - Máximo 3 conexiones VNC/SSH simultáneas a las VMs.
 
@@ -314,10 +336,21 @@ salen de ahí: el wrapper es el camino recomendado.
 ```bash
 condor_q                              # resumen por cluster
 condor_q -nobatch                     # un renglón por proceso
+condor_q 2222677 2222678 2222679      # solo esos clusters
 condor_q -better 1234                 # POR QUE no arranca (idle/held)
-tail -f htcondor/logs/2026-10-26_aniso.*.out
-tail -f htcondor/logs/2026-10-26_aniso.*.log   # eventos de Condor
+condor_watch_q                        # TUI: progreso de tus jobs (requiere terminal)
+condor_watch_q -clusters 2222677 2222678 2222679   # OJO: espacios, no comas
+tail -f htcondor/logs/out_aniso_a20.2222678.0.out
+tail -f htcondor/logs/out_aniso_a20.2222678.0.log  # eventos de Condor
 ```
+
+`condor_watch_q -clusters` es la excepción a la regla de listas: **no** acepta
+`2222677,2222678` (falla con `invalid literal for int()`); va separado por
+espacios. Además necesita una TTY: dentro de un script o de un pipe falla con
+`Inappropriate ioctl for device`, así que ahí usá `condor_q`.
+
+Los logs se llaman `$(RunName).$(Cluster).$(Process).{log,out,err}` (ver §6),
+no llevan la fecha.
 
 Estados: `I` idle, `R` running, `H` held (algo falló: `condor_q -better <id>` y
 el `.log`).
@@ -343,6 +376,10 @@ Si reenviás después de cancelar, usá otro `RunName`.
 
 Los logs de HTCondor van a `htcondor/logs/<RunName>.<Cluster>.<Process>.{log,out,err}`.
 
+El `.sub` final de cada envío queda en `htcondor/runs/<RunName>.sub` (ignorado
+por git): es el que realmente corrió, con los overrides ya inyectados antes de
+`queue`. Sirve para reproducir un envío sin recordar los argumentos.
+
 El modelo que consume la cadena de picking es el **SavedModel**
 (`Trained/<RunName>_savedmodel/`), no `ckpt.keras`.
 
@@ -353,6 +390,16 @@ El modelo que consume la cadena de picking es el **SavedModel**
 - **`--out` nuevo en cada corrida** (ver §4.2). Para reanudar una corrida
   cortada usar `--resume`, nunca `--init`.
 - **Nada en `/scratch`**: los workers no lo ven. Todo en `$HOME`.
+- **Ruta del dataset en `preextract.sub`**: `Dataset` es absoluta y en esta VM
+  tiene que ser `git/spectrum-generator/dataset`. La ruta vieja
+  `git/cheminfo/spectrum-generator/dataset` no existe (bug preexistente desde
+  `6d49cb8`): el job muere en el primer espectro con `FileNotFoundError`. Si
+  movés el dataset, actualizá esa línea.
+- **`scipy` en el venv**: generar pools con `--hard-aniso` / `--hard-axis-frac`
+  necesita `scipy` (`scipy.ndimage.distance_transform_edt`). El import es
+  perezoso, así que `preextract.py --help` no lo detecta; el faltante aparece
+  recién con el primer espectro. Instalado en `~/vtflow` el 2026-10-27
+  (1.18.1). El entrenamiento no lo usa.
 - **Memoria**: el pool con `--pool-k 24` pesa ~7 GB en disco; el job lo lee por
   archivo, así que los 8 GB de `request_memory` alcanzan. Si ves `Abnormal
   termination (signal 9)` en el `.log`, subí `request_memory`.
@@ -380,26 +427,3 @@ El modelo que consume la cadena de picking es el **SavedModel**
   `--hard-aniso`, del cupo del eje, `--pair-frac`, etc.) y para no ocupar tu VM.
 
 ---
-
-## 8. Mientras esperás el alta de Condor
-
-Esta VM tiene 64 cores y ~630 GB de RAM: el entrenamiento puede correr acá
-mismo, sin Condor, con las **mismas flags** del `.sub`:
-
-```bash
-cd ~/git/mrai_p3
-RUN=$(date +%Y%m%d_%H%M)
-# el mismo wrapper que usa train.sub: lee la geometria del manifest del pool
-nohup ./htcondor/run_train.sh "out_$RUN" pre_aniso_f2lo0_454510 \
-  > "htcondor/logs/$RUN.out" 2>&1 &
-
-tail -f "htcondor/logs/$RUN.out"
-```
-
-Si preferís el comando pelado (sin wrapper), los flags de negativos duros salen
-del pool con `scripts/pool_flags.sh data/<pool>` en vez de escribirlos a mano.
-
-Es exactamente lo que el tutorial desaconseja para el pool compartido (mejor
-1 core por job y dejar que Condor reparta), pero para una corrida única de
-1–1.5 h en tu propia VM es lo más directo y ya deja la Mac libre. Cuando
-tengas Condor, el mismo comando va como `train.sub`.
