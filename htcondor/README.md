@@ -367,6 +367,14 @@ El modelo que consume la cadena de picking es el **SavedModel**
   # requirements = GPUs_Capability >= 8    # opcional: excluye T4/V100
   ```
   Hoy esta VM no tiene GPU (`nvidia-smi` no existe) y el modelo entrena en CPU.
+- **Batch grande con pocos espectros**: con `--batch 65536` hacen falta ~23
+  espectros de train para que una época produzca al menos un batch. Con menos, el
+  guard de fin de época aborta a propósito (`epoca 0: 0 batches de
+  entrenamiento`). Para un humo antes de gastar 1,5 h:
+  ```bash
+  htcondor/submit.sh train.sub RunName=smoke Pool=pre_aniso_f2lo0_454510 \
+      Extra="--n-train 30 --n-val 5 --epochs 1"
+  ```
 - **Un entrenamiento = un job** (8 threads, ver *Recursos y política*). Condor
   no acelera una corrida sola; sirve para lanzar varias en paralelo (A/B de
   `--hard-aniso`, del cupo del eje, `--pair-frac`, etc.) y para no ocupar tu VM.
