@@ -435,7 +435,7 @@ def match_report(gt_rows, gt_cols, det, match_px):
     }
 
 
-def shape_values(P, rows, cols, offsets=(3, 6), half=1):
+def shape_values(P, rows, cols, offsets=(2, 3, 6, 8, 10, 12), half=1):
     """Decay de |P| alrededor de cada pico GT, por eje (F1 = filas, F2 = cols).
 
     Para cada centro `(row, col)` se toma el máximo local en una ventana de
