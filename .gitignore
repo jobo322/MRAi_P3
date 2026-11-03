@@ -24,6 +24,9 @@ docs/*.pdf
 htcondor/logs/*
 !htcondor/logs/.gitkeep
 
+# Copies of the final .sub written by htcondor/submit.sh (per-run, regenerable)
+htcondor/runs/
+
 # Google Drive's duplicate-name download marker, e.g.
 # out_elong-20261015T162906Z-1-001.zip. When the same run is also present
 # as a directory (Trained/out_elong/), the zip is a byte-identical copy.
